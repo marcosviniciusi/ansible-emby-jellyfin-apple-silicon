@@ -1,0 +1,6 @@
+---
+- name: Update Emby Server on Mac Mini
+  hosts: macmini
+  gather_facts: true
+  roles:
+    - role: emby_update

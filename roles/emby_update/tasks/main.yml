@@ -1,0 +1,282 @@
+---
+# Emby Server update role
+# Pulls latest stable from MediaBrowser/Emby.Releases GitHub releases,
+# installs to /Applications/EmbyServer.app, restarts launchd daemon.
+
+- name: "Emby | Ensure download tmp dir exists"
+  ansible.builtin.file:
+    path: "{{ download_tmp }}"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: "Emby | Query GitHub for latest stable release"
+  ansible.builtin.uri:
+    url: "https://api.github.com/repos/MediaBrowser/Emby.Releases/releases?per_page=20"
+    return_content: true
+    headers:
+      Accept: "application/vnd.github+json"
+  delegate_to: localhost
+  become: false
+  register: emby_releases_resp
+  check_mode: false
+
+- name: "Emby | Pick latest release (skip pre-releases unless include_prereleases=true)"
+  ansible.builtin.set_fact:
+    emby_latest: >-
+      {{ (emby_releases_resp.json
+          | rejectattr('draft')
+          | selectattr('prerelease', 'equalto', include_prereleases)
+          | list
+          | first)
+         if not include_prereleases else
+         (emby_releases_resp.json | rejectattr('draft') | list | first) }}
+
+- name: "Emby | Find macOS arm64 asset"
+  ansible.builtin.set_fact:
+    emby_asset: >-
+      {{ (emby_latest.assets
+          | selectattr('name', 'match', '^embyserver-osx-arm64-.*\.zip$')
+          | list | first) }}
+
+- name: "Emby | Fail if no arm64 asset found"
+  ansible.builtin.fail:
+    msg: "No macOS arm64 asset found in release {{ emby_latest.tag_name }}"
+  when: emby_asset is not defined or emby_asset == ''
+
+- name: "Emby | Compute target version"
+  ansible.builtin.set_fact:
+    emby_target_version: "{{ emby_latest.tag_name | regex_replace('^v','') | regex_replace('-beta$','') }}"
+    emby_asset_url: "{{ emby_asset.browser_download_url }}"
+    emby_asset_name: "{{ emby_asset.name }}"
+
+- name: "Emby | Read currently installed version"
+  ansible.builtin.shell: |
+    set -o pipefail
+    /usr/bin/plutil -extract CFBundleVersion raw -o - "{{ emby_app_path }}/Contents/Info.plist" 2>/dev/null || echo "0.0.0.0"
+  args:
+    executable: /bin/bash
+  register: emby_installed_version_raw
+  changed_when: false
+  check_mode: false
+
+- name: "Emby | Set installed version fact"
+  ansible.builtin.set_fact:
+    emby_installed_version: "{{ emby_installed_version_raw.stdout | trim }}"
+
+- name: "Emby | Show version comparison"
+  ansible.builtin.debug:
+    msg:
+      - "Installed: {{ emby_installed_version }}"
+      - "Latest:    {{ emby_target_version }} (tag: {{ emby_latest.tag_name }})"
+      - "Asset:     {{ emby_asset_name }}"
+
+- name: "Emby | Skip update if already at target version"
+  ansible.builtin.meta: end_host
+  when:
+    - not force_update
+    - emby_installed_version == emby_target_version
+
+- name: "Emby | Download asset to localhost"
+  ansible.builtin.get_url:
+    url: "{{ emby_asset_url }}"
+    dest: "/tmp/{{ emby_asset_name }}"
+    mode: "0644"
+    timeout: 120
+  delegate_to: localhost
+  become: false
+  register: emby_download
+
+- name: "Emby | Upload archive to target"
+  ansible.builtin.copy:
+    src: "/tmp/{{ emby_asset_name }}"
+    dest: "{{ download_tmp }}/{{ emby_asset_name }}"
+    mode: "0644"
+  become: true
+
+- name: "Emby | Clean extraction directory"
+  ansible.builtin.file:
+    path: "{{ download_tmp }}/emby-extract"
+    state: absent
+  become: true
+
+- name: "Emby | Create extraction directory"
+  ansible.builtin.file:
+    path: "{{ download_tmp }}/emby-extract"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: "Emby | Extract archive"
+  ansible.builtin.unarchive:
+    src: "{{ download_tmp }}/{{ emby_asset_name }}"
+    dest: "{{ download_tmp }}/emby-extract"
+    remote_src: true
+  become: true
+
+- name: "Emby | Verify extracted .app present"
+  ansible.builtin.stat:
+    path: "{{ download_tmp }}/emby-extract/osx-arm64/EmbyServer.app/Contents/MacOS/EmbyServer"
+  become: true
+  register: emby_new_binary
+
+- name: "Emby | Fail if extracted bundle invalid"
+  ansible.builtin.fail:
+    msg: "Extracted archive does not contain expected EmbyServer binary"
+  when: not emby_new_binary.stat.exists
+
+- name: "Emby | Ensure backup dirs exist"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: wheel
+  become: true
+  loop:
+    - "{{ backup_dir }}"
+    - "{{ db_backup_dir }}"
+
+- name: "Emby | Compute timestamp"
+  ansible.builtin.set_fact:
+    update_ts: "{{ ansible_date_time.iso8601_basic_short }}"
+
+# ------------------------------------------------------------------
+# DB + config backup (local-only — NFS-mounted dirs are excluded)
+# Runs BEFORE launchd stop so failure here doesn't disrupt service.
+# Uses sqlite3 .backup for consistent live snapshots.
+# ------------------------------------------------------------------
+- name: "Emby | DB backup | Snapshot SQLite + tar config/plugins (local only)"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    STAGE="$(/usr/bin/mktemp -d /tmp/emby-snap-XXXXXX)"
+    /bin/mkdir -p "$STAGE/data"
+    # SQLite live snapshots — safe while daemon writes
+    for db in library users authentication activitylog; do
+      SRC="{{ emby_data_path }}/data/${db}.db"
+      if [ -f "$SRC" ]; then
+        "{{ sqlite3_bin }}" "$SRC" ".backup '$STAGE/data/${db}.db'"
+      fi
+    done
+    # Copy non-DB local state from data/ (livetv, ScheduledTasks, txt files)
+    # — excludes the live .db files (we have snapshots) and -wal/-shm
+    /usr/bin/rsync -a \
+      --exclude='*.db' --exclude='*.db-wal' --exclude='*.db-shm' \
+      "{{ emby_data_path }}/data/" "$STAGE/data/"
+    # Config + plugins are 100% local
+    /usr/bin/rsync -a "{{ emby_data_path }}/config/"  "$STAGE/config/"
+    /usr/bin/rsync -a "{{ emby_data_path }}/plugins/" "$STAGE/plugins/"
+    # Tar it up. Skip NFS symlinks (cache, metadata), logs, transcoding-temp by NOT including them.
+    OUT="{{ db_backup_dir }}/emby-{{ emby_installed_version }}-{{ update_ts }}.tar.gz"
+    /usr/bin/tar -czf "$OUT" -C "$STAGE" data config plugins
+    /bin/chmod 0640 "$OUT"
+    /bin/rm -rf "$STAGE"
+    /bin/ls -lh "$OUT"
+  args:
+    executable: /bin/bash
+  become: true
+  register: emby_db_backup
+
+- name: "Emby | DB backup | Result"
+  ansible.builtin.debug:
+    msg: "{{ emby_db_backup.stdout_lines | last }}"
+
+- name: "Emby | DB backup | Push to off-machine NFS"
+  ansible.builtin.include_role:
+    name: nfs_push
+  vars:
+    nfs_push_file: "{{ db_backup_dir }}/emby-{{ emby_installed_version }}-{{ update_ts }}.tar.gz"
+    nfs_push_prefix: "emby-"
+
+- name: "Emby | Stop launchd daemon"
+  ansible.builtin.command: >
+    launchctl bootout system {{ launchd_path }}/{{ emby_launchd_label }}.plist
+  become: true
+  register: emby_stop
+  failed_when: false
+  changed_when: emby_stop.rc == 0
+
+- name: "Emby | Wait for process to exit"
+  ansible.builtin.shell: |
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      if ! /usr/bin/pgrep -f EmbyServer >/dev/null; then exit 0; fi
+      /bin/sleep 1
+    done
+    /usr/bin/pkill -9 -f EmbyServer || true
+  become: true
+  changed_when: false
+
+- name: "Emby | Backup current bundle (move)"
+  ansible.builtin.command: >
+    mv "{{ emby_app_path }}" "{{ backup_dir }}/EmbyServer.app.{{ emby_installed_version }}.{{ update_ts }}"
+  become: true
+  args:
+    removes: "{{ emby_app_path }}"
+
+- name: "Emby | Install new bundle"
+  ansible.builtin.command: >
+    mv "{{ download_tmp }}/emby-extract/osx-arm64/EmbyServer.app" "{{ emby_app_path }}"
+  become: true
+  args:
+    creates: "{{ emby_app_path }}/Contents/MacOS/EmbyServer"
+
+- name: "Emby | chown to root:wheel"
+  ansible.builtin.file:
+    path: "{{ emby_app_path }}"
+    owner: root
+    group: wheel
+    recurse: true
+  become: true
+
+- name: "Emby | Strip quarantine xattr"
+  ansible.builtin.command: xattr -dr com.apple.quarantine "{{ emby_app_path }}"
+  become: true
+  failed_when: false
+  changed_when: false
+
+- name: "Emby | Strip AppleDouble files"
+  ansible.builtin.shell: |
+    find "{{ emby_app_path }}" \( -name '._*' -o -name '.DS_Store' \) -delete
+  become: true
+  changed_when: false
+
+- name: "Emby | Start launchd daemon"
+  ansible.builtin.command: >
+    launchctl bootstrap system {{ launchd_path }}/{{ emby_launchd_label }}.plist
+  become: true
+
+- name: "Emby | Wait for HTTP /System/Info/Public"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ emby_port }}/System/Info/Public"
+    return_content: true
+    status_code: 200
+  register: emby_check
+  retries: "{{ (http_wait_seconds // 5) | int }}"
+  delay: 5
+  until: emby_check.status == 200
+
+- name: "Emby | Show running version"
+  ansible.builtin.debug:
+    msg: "Emby is up: {{ emby_check.json.ServerName }} v{{ emby_check.json.Version }}"
+
+- name: "Emby | Prune old app backups (keep last {{ keep_backups }})"
+  ansible.builtin.shell: |
+    set -o pipefail
+    cd "{{ backup_dir }}" && \
+    /bin/ls -1dt EmbyServer.app.* 2>/dev/null | tail -n +{{ keep_backups | int + 1 }} | \
+      while read -r d; do /bin/rm -rf "{{ backup_dir }}/$d"; done
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+
+- name: "Emby | Prune old DB backups (keep last {{ keep_db_backups }})"
+  ansible.builtin.shell: |
+    set -o pipefail
+    cd "{{ db_backup_dir }}" && \
+    /bin/ls -1t emby-*.tar.gz 2>/dev/null | tail -n +{{ keep_db_backups | int + 1 }} | \
+      while read -r f; do /bin/rm -f "{{ db_backup_dir }}/$f"; done
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false

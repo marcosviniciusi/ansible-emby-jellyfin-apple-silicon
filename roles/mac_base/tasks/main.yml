@@ -1,0 +1,111 @@
+---
+# mac_base — system-level prep for a fresh Mac Mini.
+# All values come from group_vars; templates render the actual file content.
+
+- name: "mac_base | Set hostname to '{{ mac_hostname }}' (ComputerName + HostName + LocalHostName)"
+  ansible.builtin.shell: |
+    /usr/sbin/scutil --set ComputerName  "{{ mac_hostname }}"
+    /usr/sbin/scutil --set HostName      "{{ mac_hostname }}"
+    /usr/sbin/scutil --set LocalHostName "{{ mac_hostname }}"
+    /usr/bin/dscacheutil -flushcache
+  args:
+    executable: /bin/bash
+  become: true
+  when: mac_hostname | default('') | length > 0
+  changed_when: false
+
+- name: "mac_base | Ensure '{{ media_group }}' group exists (gid {{ media_gid }})"
+  ansible.builtin.shell: |
+    if ! /usr/bin/dscl . -read /Groups/{{ media_group }} >/dev/null 2>&1; then
+      /usr/bin/dscl . -create /Groups/{{ media_group }}
+      /usr/bin/dscl . -create /Groups/{{ media_group }} PrimaryGroupID {{ media_gid }}
+      /usr/bin/dscl . -create /Groups/{{ media_group }} RealName "{{ media_realname }}"
+      /usr/bin/dscl . -create /Groups/{{ media_group }} Password "*"
+    fi
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+
+- name: "mac_base | Ensure '{{ media_user }}' user exists (uid {{ media_uid }})"
+  ansible.builtin.shell: |
+    if ! /usr/bin/dscl . -read /Users/{{ media_user }} >/dev/null 2>&1; then
+      /usr/bin/dscl . -create /Users/{{ media_user }}
+      /usr/bin/dscl . -create /Users/{{ media_user }} UniqueID {{ media_uid }}
+      /usr/bin/dscl . -create /Users/{{ media_user }} PrimaryGroupID {{ media_gid }}
+      /usr/bin/dscl . -create /Users/{{ media_user }} UserShell /usr/bin/false
+      /usr/bin/dscl . -create /Users/{{ media_user }} RealName "{{ media_realname }}"
+      /usr/bin/dscl . -create /Users/{{ media_user }} NFSHomeDirectory /var/empty
+      /usr/bin/dscl . -create /Users/{{ media_user }} Password "*"
+    fi
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+
+- name: "mac_base | Render /etc/synthetic.conf ({{ data_root }} symlink at boot)"
+  ansible.builtin.template:
+    src: synthetic.conf.j2
+    dest: /etc/synthetic.conf
+    owner: root
+    group: wheel
+    mode: "0644"
+  become: true
+  register: synthetic_conf
+
+- name: "mac_base | Ensure /etc/auto_master has /etc/auto_nfs entry"
+  ansible.builtin.lineinfile:
+    path: /etc/auto_master
+    line: "/-\t\t\t/etc/auto_nfs\t\t-nosuid,noowners"
+    insertafter: EOF
+    state: present
+    create: false
+  become: true
+
+- name: "mac_base | Render /etc/auto_nfs"
+  ansible.builtin.template:
+    src: auto_nfs.j2
+    dest: /etc/auto_nfs
+    owner: root
+    group: wheel
+    mode: "0644"
+  become: true
+  notify: reload automount
+
+- name: "mac_base | Render TCP keepalive LaunchDaemon"
+  ansible.builtin.template:
+    src: com.local.tcp-keepalive.plist.j2
+    dest: "{{ launchd_path }}/com.local.tcp-keepalive.plist"
+    owner: root
+    group: wheel
+    mode: "0644"
+  become: true
+  notify: bootstrap tcp-keepalive
+
+- name: "mac_base | Apply TCP keepalive sysctls now"
+  ansible.builtin.command: /usr/sbin/sysctl -w {{ item }}
+  loop:
+    - "net.inet.tcp.always_keepalive={{ tcp_always_keepalive }}"
+    - "net.inet.tcp.keepidle={{ tcp_keepidle_ms }}"
+    - "net.inet.tcp.keepintvl={{ tcp_keepintvl_ms }}"
+    - "net.inet.tcp.keepcnt={{ tcp_keepcnt }}"
+  become: true
+  changed_when: false
+
+- name: "mac_base | Warn if synthetic.conf was just rendered (reboot needed)"
+  ansible.builtin.debug:
+    msg: >
+      /etc/synthetic.conf was created/changed. A REBOOT is required for
+      {{ data_root }} to appear as a symlink at root (macOS only re-evaluates
+      synthetic.conf at boot). Until you reboot, the Jellyfin/Emby installs
+      may fail at {{ data_root }}/* paths.
+  when: synthetic_conf is changed
+
+- name: "mac_base | Ensure /var/lib root exists"
+  ansible.builtin.file:
+    path: /var/lib
+    state: directory
+    owner: root
+    group: wheel
+    mode: "0755"
+  become: true

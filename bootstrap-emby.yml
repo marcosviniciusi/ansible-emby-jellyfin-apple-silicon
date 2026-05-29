@@ -1,0 +1,6 @@
+---
+- name: Bootstrap Emby (fresh install — binary + plist + launchd)
+  hosts: macmini
+  gather_facts: true
+  roles:
+    - role: emby_install

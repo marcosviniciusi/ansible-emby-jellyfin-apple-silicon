@@ -1,0 +1,4 @@
+# {{ ansible_managed }}
+# Auto NFS mounts for Jellyfin + Emby (paths match the K8s cluster layout)
+{{ videos_mount }}       -fstype=nfs,{{ nfs_mount_opts_ro }}    {{ nfs_server }}:{{ nfs_videos_export }}
+{{ nfs_midia_mount }}    -fstype=nfs,{{ nfs_mount_opts_rw }}    {{ nfs_server }}:{{ nfs_midia_export }}

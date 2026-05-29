@@ -1,0 +1,43 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!-- {{ ansible_managed }} -->
+<!DOCTYPE plist PUBLIC '-//Apple//DTD PLIST 1.0//EN' 'http://www.apple.com/DTDs/PropertyList-1.0.dtd'>
+<plist version='1.0'>
+<dict>
+    <key>Label</key>
+    <string>{{ emby_launchd_label }}</string>
+    <key>UserName</key>
+    <string>{{ emby_user }}</string>
+    <key>GroupName</key>
+    <string>{{ emby_group }}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>{{ emby_data_path }}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{ service_path_env }}</string>
+        <key>HOME</key>
+        <string>{{ emby_data_path }}</string>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{ emby_app_path }}/Contents/MacOS/EmbyServer</string>
+        <string>-programdata</string>
+        <string>{{ emby_data_path }}</string>
+        <string>-service</string>
+        <string>-noautoupdate</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>{{ emby_subdir_logs }}/launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{ emby_subdir_logs }}/launchd-stderr.log</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>{{ emby_softlimit_nofiles }}</integer>
+    </dict>
+</dict>
+</plist>

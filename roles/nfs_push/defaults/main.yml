@@ -1,0 +1,49 @@
+---
+# =============================================================================
+#  Defaults for the `nfs_push` role.
+#
+#  Pushes a local backup file to an off-machine NFS share, so backups
+#  survive a total Mac wipe. Mount → cp -p → prune → unmount. The
+#  unmount runs in an `always:` block so the share is never left mounted
+#  if a later step fails.
+#
+#  The role is included by:
+#    - jellyfin_update / emby_update (right after local DB snapshot)
+#    - backup-only.yml
+#
+#  When invoked, the caller passes:
+#    nfs_push_file    - absolute path of the local file to push
+#    nfs_push_prefix  - filename prefix for prune scoping (e.g. "emby-")
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Master switch
+#
+#  Set to false to skip the push entirely (e.g. for testing). When false,
+#  the role logs a debug message and returns without mounting anything.
+# -----------------------------------------------------------------------------
+nfs_backup_enabled: true
+
+# -----------------------------------------------------------------------------
+#  Temporary mountpoint
+#
+#  The role mounts the NFS share here for the duration of the push then
+#  unmounts and removes the directory. /private/tmp is acceptable on
+#  macOS — it's a real RW location not subject to SIP autofs restrictions.
+# -----------------------------------------------------------------------------
+nfs_backup_mount: /private/tmp/nfs-backup
+
+# -----------------------------------------------------------------------------
+#  Subdirectory under the NFS export where backups are dropped
+#  (so the share root can hold other things if needed).
+# -----------------------------------------------------------------------------
+nfs_backup_remote_subdir: db
+
+# -----------------------------------------------------------------------------
+#  Off-machine retention
+#
+#  More generous than the local count (which is bounded by the Mac SSD).
+#  30 days x 1 backup/day = 30 backups by default. Tune up if storage
+#  is plentiful or you take more frequent backups.
+# -----------------------------------------------------------------------------
+keep_remote_db_backups: 30

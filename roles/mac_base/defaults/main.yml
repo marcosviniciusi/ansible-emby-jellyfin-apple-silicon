@@ -1,0 +1,82 @@
+---
+# =============================================================================
+#  Defaults for the `mac_base` role.
+#
+#  Configures system-level prerequisites on a fresh macOS host:
+#    - Service user `media` (uid/gid 10000 by default — set in group_vars)
+#    - /etc/synthetic.conf → creates the /data symlink at boot
+#    - /etc/auto_master + /etc/auto_nfs → NFSv4 auto-mounts
+#    - /Library/LaunchDaemons/com.local.tcp-keepalive.plist → keeps NFS
+#      connections alive across firewalls with idle TCP timeouts
+#
+#  Override any of these values via group_vars/macmini.yml or `-e var=value`.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Cosmetic display name attached to the media user/group (DirectoryServices).
+# -----------------------------------------------------------------------------
+media_realname: "Media Server"
+
+# -----------------------------------------------------------------------------
+#  Mac hostname. Applied to all three macOS hostname properties:
+#    - ComputerName  (friendly name shown in System Settings → Sharing)
+#    - HostName      (command-line tools, `hostname` command)
+#    - LocalHostName (Bonjour name, becomes <hostname>.local)
+#
+#  Set to a non-empty string to enforce; leave empty to keep whatever the
+#  Mac already has.
+# -----------------------------------------------------------------------------
+mac_hostname: media01
+
+# -----------------------------------------------------------------------------
+#  Target that /etc/synthetic.conf points the `/data` symlink at.
+#
+#  macOS's root volume is read-only since Catalina, so symlinks at root must
+#  be declared via /etc/synthetic.conf. The convention is to point at
+#  /System/Volumes/Data/<name>, which is the writable data volume.
+#
+#  CHANGES TO THIS REQUIRE A REBOOT — macOS only re-evaluates synthetic.conf
+#  at boot.
+# -----------------------------------------------------------------------------
+data_root_target: System/Volumes/Data/data
+
+# -----------------------------------------------------------------------------
+#  NFS mount options for the videos (read-only) and metadata (read-write)
+#  exports. These are passed as the `-fstype=` argument in /etc/auto_nfs.
+#
+#  Notes:
+#    - vers=4 is required; vers=3 needs portmapper which is messier through
+#      a firewall.
+#    - `nolocks` is INCOMPATIBLE with NFSv4 on macOS and will cause mount
+#      failures with "Invalid argument" — do not add it.
+#    - `hard,intr,timeo=600,retrans=2` can be appended for resilience
+#      against transient NFS server pauses (NFS sleeps the caller instead
+#      of erroring; processes can be interrupted).
+# -----------------------------------------------------------------------------
+nfs_mount_opts_ro: "vers=4,ro"
+nfs_mount_opts_rw: "vers=4,rw"
+
+# -----------------------------------------------------------------------------
+#  TCP keepalive sysctls applied at every boot and immediately at install.
+#
+#  Why: NFS-over-TCP is a long-lived idle connection. When it crosses a
+#  stateful firewall (e.g. OPNsense pf), the state-table entry expires after
+#  N seconds of silence and the next packet is dropped — symptom is "NFS
+#  server not responding" on the client. macOS defaults are too lax for that:
+#    - always_keepalive=0 (most apps never opt in via SO_KEEPALIVE)
+#    - keepidle=2h         (probe doesn't fire until well after firewall
+#                           state has expired)
+#
+#  These four sysctls force keepalive on every TCP socket, send the first
+#  probe after 2 minutes of idle, and retry every 30s up to 8 times. End
+#  result: firewall state is refreshed every ~2 minutes; dead server is
+#  detected within ~4 minutes.
+#
+#  Tune `tcp_keepidle_ms` lower if your firewall has very short idle
+#  timeouts (e.g. cheap consumer NAT). Tune higher if you want to reduce
+#  background packet noise.
+# -----------------------------------------------------------------------------
+tcp_always_keepalive: 1        # 0=off, 1=force keepalive on every TCP socket
+tcp_keepidle_ms: 120000        # idle ms before first probe (2 minutes)
+tcp_keepintvl_ms: 30000        # ms between probes (30 seconds)
+tcp_keepcnt: 8                 # probes before declaring connection dead

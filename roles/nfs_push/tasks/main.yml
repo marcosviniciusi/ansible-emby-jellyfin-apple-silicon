@@ -1,0 +1,104 @@
+---
+# Push a single local backup file to the off-machine NFS share.
+# Vars required from caller:
+#   nfs_push_file    - absolute path of local file to push
+#   nfs_push_prefix  - filename prefix used for remote prune (e.g. "emby-")
+#
+# Behavior: mount NFS, rsync the file, prune old by prefix
+# (keeping keep_remote_db_backups newest), unmount, remove mount dir.
+# Mount/umount is best-effort wrapped in always: to avoid leaving stale mounts.
+
+- name: "NFS push | Skip when disabled"
+  ansible.builtin.debug:
+    msg: "nfs_backup_enabled=false — skipping off-machine push"
+  when: not (nfs_backup_enabled | bool)
+
+- name: "NFS push | Sanity check: local file exists"
+  ansible.builtin.stat:
+    path: "{{ nfs_push_file }}"
+  become: true
+  register: _nfs_push_stat
+  when: nfs_backup_enabled | bool
+
+- name: "NFS push | Fail if local backup file missing"
+  ansible.builtin.fail:
+    msg: "Local backup file not found: {{ nfs_push_file }}"
+  when:
+    - nfs_backup_enabled | bool
+    - not _nfs_push_stat.stat.exists
+
+- name: "NFS push | mount + copy + prune + umount"
+  when: nfs_backup_enabled | bool
+  block:
+    - name: "NFS push | Ensure mountpoint dir exists"
+      ansible.builtin.file:
+        path: "{{ nfs_backup_mount }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: wheel
+      become: true
+
+    - name: "NFS push | Mount {{ nfs_backup_server }}:{{ nfs_backup_export }}"
+      ansible.builtin.command: >
+        /sbin/mount -t nfs -o vers=4,rw
+        {{ nfs_backup_server }}:{{ nfs_backup_export }}
+        {{ nfs_backup_mount }}
+      become: true
+      register: _nfs_push_mount
+      changed_when: _nfs_push_mount.rc == 0
+
+    - name: "NFS push | Ensure remote subdir exists"
+      ansible.builtin.file:
+        path: "{{ nfs_backup_mount }}/{{ nfs_backup_remote_subdir }}"
+        state: directory
+        mode: "0755"
+      become: true
+
+    # Note: shipped macOS rsync is 2.6.9 (ancient) and lacks many flags.
+    # Use /bin/cp -p for portability — preserves mtime, atomic enough on NFSv4.
+    - name: "NFS push | Copy backup file to NFS"
+      ansible.builtin.command: >
+        /bin/cp -p
+        "{{ nfs_push_file }}"
+        "{{ nfs_backup_mount }}/{{ nfs_backup_remote_subdir }}/"
+      become: true
+      register: _nfs_push_copy
+      changed_when: true
+
+    - name: "NFS push | Show pushed file size"
+      ansible.builtin.shell: |
+        /bin/ls -lh "{{ nfs_backup_mount }}/{{ nfs_backup_remote_subdir }}/{{ nfs_push_file | basename }}"
+      args:
+        executable: /bin/bash
+      become: true
+      register: _nfs_push_remote_ls
+      changed_when: false
+
+    - name: "NFS push | Pushed"
+      ansible.builtin.debug:
+        msg: "{{ _nfs_push_remote_ls.stdout }}"
+
+    - name: "NFS push | Prune remote (keep last {{ keep_remote_db_backups }} of '{{ nfs_push_prefix }}*')"
+      ansible.builtin.shell: |
+        cd "{{ nfs_backup_mount }}/{{ nfs_backup_remote_subdir }}" && \
+        /bin/ls -1t {{ nfs_push_prefix }}*.tar.gz 2>/dev/null | tail -n +{{ keep_remote_db_backups | int + 1 }} | \
+          while read -r f; do /bin/rm -f "{{ nfs_backup_mount }}/{{ nfs_backup_remote_subdir }}/$f"; done
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+  always:
+    - name: "NFS push | Unmount NFS (always)"
+      ansible.builtin.command: /sbin/umount "{{ nfs_backup_mount }}"
+      become: true
+      register: _nfs_push_umount
+      failed_when: false
+      changed_when: _nfs_push_umount.rc == 0
+
+    - name: "NFS push | Remove mountpoint dir (always, if empty)"
+      ansible.builtin.command: /bin/rmdir "{{ nfs_backup_mount }}"
+      become: true
+      failed_when: false
+      changed_when: false

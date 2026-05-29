@@ -1,0 +1,100 @@
+---
+# =============================================================================
+#  Environment-specific configuration for the `macmini` group.
+#
+#  This file holds values that change PER INSTALLATION (different NFS server,
+#  different user IDs, different ffmpeg location, etc). Role-specific defaults
+#  live in `roles/<role>/defaults/main.yml`.
+#
+#  Override precedence (Ansible):
+#    1. extra-vars (-e var=value)            ← highest
+#    2. group_vars/macmini.yml               ← this file
+#    3. roles/<role>/defaults/main.yml       ← lowest, role-supplied defaults
+#
+#  Any value defined here overrides the role defaults. To override only for a
+#  single run: `make <target> EXTRA='-e var=value'`.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Identity of the service user that owns Jellyfin/Emby files on the Mac.
+#  uid/gid 10000 matches the NFS export squash mapping on the storage server
+#  (see /etc/exports: anonuid=10000,anongid=10000). Changing this here means
+#  you must also change it on the NFS server's exports.
+# -----------------------------------------------------------------------------
+media_user: media
+media_group: media
+media_uid: 10000
+media_gid: 10000
+
+# -----------------------------------------------------------------------------
+#  Primary NFS server (the storage box on the LAN).
+#
+#  Required exports on the NFS server side (Linux example: /etc/exports):
+#
+#    /export                <client_ip>(sync,ro,insecure,root_squash,fsid=0)
+#    /export/videos         <client_ip>(async,ro,insecure,all_squash,
+#                                       anonuid=10000,anongid=10000,fsid=...)
+#    /export/nfs-midia      <client_ip>(async,rw,insecure,all_squash,
+#                                       anonuid=10000,anongid=10000,fsid=...)
+#    /export/dmz3-backup    <client_ip>/32(async,rw,insecure,all_squash,
+#                                          anonuid=10000,anongid=10000,fsid=...)
+#
+#  The fsid=0 on /export is the NFSv4 pseudoroot — without it the Mac
+#  client receives "Invalid argument" on mount.
+#
+#  Then on the server:
+#    sudo exportfs -ra
+#    sudo systemctl restart nfs-server   # only if needed
+# -----------------------------------------------------------------------------
+nfs_server: 192.168.253.250
+
+# Export paths AS SEEN BY THE CLIENT (after NFSv4 pseudoroot stripping).
+# If the server has /export/videos, the client mounts it as ":/videos".
+nfs_videos_export: /videos               # read-only media library
+nfs_midia_export: /nfs-midia             # read-write metadata/cache for Emby+Jellyfin
+
+# Off-machine backup target (same server by default; can be a different one)
+nfs_backup_server: "{{ nfs_server }}"
+nfs_backup_export: /dmz3-backup
+
+# -----------------------------------------------------------------------------
+#  Filesystem layout on the Mac client.
+#
+#  /data is created as a symlink at boot via /etc/synthetic.conf so it can
+#  live at the root of the read-only system volume. The actual target lives
+#  under /System/Volumes/Data/. Two NFS mounts are managed via autofs and
+#  appear under /data.
+# -----------------------------------------------------------------------------
+data_root: /data
+videos_mount: "{{ data_root }}/videos"
+nfs_midia_mount: "{{ data_root }}/nfs-midia"
+
+# -----------------------------------------------------------------------------
+#  Tooling paths on the Mac.
+#
+#  - ffmpeg: Homebrew on Apple Silicon ships at /opt/homebrew (Intel: /usr/local).
+#    The jellyfin-ffmpeg fork has no published macOS arm64 build, so we use
+#    Homebrew's ffmpeg, which has VideoToolbox + AudioToolbox enabled.
+#  - sqlite3: macOS ships sqlite3 in /usr/bin (currently 3.43).
+#  - launchd_path: where LaunchDaemon plists are installed.
+# -----------------------------------------------------------------------------
+ffmpeg_path: /opt/homebrew/bin/ffmpeg
+brew_bin: /opt/homebrew/bin/brew
+sqlite3_bin: /usr/bin/sqlite3
+launchd_path: /Library/LaunchDaemons
+
+# PATH used by LaunchDaemons (Homebrew bin first so jellyfin can find ffmpeg)
+service_path_env: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# -----------------------------------------------------------------------------
+#  Shared operational settings.
+#  Used by update + backup + nfs_push roles.
+# -----------------------------------------------------------------------------
+backup_dir: /var/backups/mac-media                # local backup root
+db_backup_dir: "{{ backup_dir }}/db"              # local DB tarball subdir
+download_tmp: /tmp/mac-media-update               # staging area for downloads
+http_wait_seconds: 90                              # daemon health-check timeout
+
+# Update flags (per-invocation, usually overridden via -e)
+force_update: false        # if true, reinstall even when versions match
+include_prereleases: false # Emby: also consider beta releases

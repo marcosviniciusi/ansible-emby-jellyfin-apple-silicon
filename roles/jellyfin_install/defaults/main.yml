@@ -1,0 +1,78 @@
+---
+# =============================================================================
+#  Defaults for the `jellyfin_install` role.
+#
+#  Performs a fresh install of Jellyfin Server on macOS arm64:
+#    1. Fetches the latest stable from https://repo.jellyfin.org
+#    2. Extracts to {{ jellyfin_install_path }}
+#    3. Creates the data directory tree under {{ jellyfin_data_path }}
+#    4. Renders the LaunchDaemon plist from a Jinja template
+#    5. Bootstraps the daemon and waits for HTTP /System/Info/Public
+#
+#  The role is idempotent: if the binary is already installed, the download
+#  step is skipped and the role only ensures directories, ownership, plist,
+#  and daemon state are correct.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Filesystem layout
+#
+#  - jellyfin_install_path: where the binary + dlls live (Jellyfin is a
+#    .NET app — many files, not just one binary).
+#  - jellyfin_data_path: configdir (XMLs, plugins, DB live under data/).
+# -----------------------------------------------------------------------------
+jellyfin_install_path: /opt/jellyfin
+jellyfin_data_path: /var/lib/jellyfin
+
+# -----------------------------------------------------------------------------
+#  launchd identity and HTTP port
+#
+#  - jellyfin_launchd_label: label used by `launchctl bootstrap/bootout`
+#    and as the plist filename ({{ launchd_path }}/{{ label }}.plist).
+#  - jellyfin_port: HTTP listener. Default 8097 because Emby owns 8096 on
+#    the same Mac; if you only run Jellyfin you can leave it as 8096.
+# -----------------------------------------------------------------------------
+jellyfin_launchd_label: com.jellyfin.server
+jellyfin_port: 8097
+
+# -----------------------------------------------------------------------------
+#  Service identity
+#
+#  Resolved from `media_user`/`media_group` defined in group_vars. Override
+#  here if you want to run Jellyfin under a different user.
+# -----------------------------------------------------------------------------
+jellyfin_user: "{{ media_user }}"
+jellyfin_group: "{{ media_group }}"
+
+# -----------------------------------------------------------------------------
+#  Derived data subdirectories
+#
+#  Jellyfin distinguishes between configdir (root), datadir, cachedir,
+#  logdir. The CLI flags in the plist point at each one explicitly so we
+#  can put cache on NFS while keeping the SQLite DB local.
+# -----------------------------------------------------------------------------
+jellyfin_subdir_data: "{{ jellyfin_data_path }}/data"
+jellyfin_subdir_log: "{{ jellyfin_data_path }}/log"
+jellyfin_subdir_transcode: "{{ jellyfin_data_path }}/transcoding-temp"
+
+# -----------------------------------------------------------------------------
+#  NFS-backed paths (consumed by `--cachedir` and at runtime by Jellyfin)
+#
+#  Cache and metadata live on the NFS server so they survive a Mac wipe
+#  and are shared with anything else that wants to read them. Trickplay
+#  thumbnails go on NFS too because they're large and regenerable.
+#
+#  Transcoding intentionally goes to LOCAL SSD (see jellyfin_subdir_transcode
+#  above) — transcoding hammers the disk and NFS would be slow + waste IO.
+# -----------------------------------------------------------------------------
+jellyfin_cache_path: "{{ nfs_midia_mount }}/jellyfin/cache"
+jellyfin_metadata_path: "{{ nfs_midia_mount }}/jellyfin/metadata"
+jellyfin_trickplay_path: "{{ nfs_midia_mount }}/jellyfin/trickplay"
+
+# -----------------------------------------------------------------------------
+#  ffmpeg binary used by Jellyfin
+#
+#  Defaults to the value from group_vars (Homebrew ffmpeg). The role will
+#  `brew install ffmpeg` if the binary is missing.
+# -----------------------------------------------------------------------------
+jellyfin_ffmpeg_path: "{{ ffmpeg_path }}"

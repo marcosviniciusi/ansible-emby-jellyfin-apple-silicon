@@ -1,0 +1,2 @@
+{# {{ ansible_managed }} - cannot use comment in synthetic.conf (parser is strict) #}
+{{ data_root | regex_replace('^/', '') }}	{{ data_root_target }}

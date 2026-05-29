@@ -1,0 +1,33 @@
+---
+# Bootstrap: from-scratch / disaster-recovery install of Jellyfin + Emby
+# on a fresh macOS host. Idempotent — safe to re-run.
+#
+# Sequence:
+#   1) mac_base    — media user, /etc/synthetic.conf, /etc/auto_nfs, TCP keepalive plist
+#                    REBOOT REQUIRED here if /data symlink was just declared.
+#   2) jellyfin_install — download Jellyfin arm64 → /opt/jellyfin → plist → start
+#   3) emby_install     — download Emby arm64 → /Applications/EmbyServer.app → plist → start
+#
+# NOT INCLUDED (manual steps on first install):
+#   - Homebrew install (run /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)")
+#   - Restore /var/lib/{emby,jellyfin} from a DB tarball (use 'make backup' from
+#     the previous Mac, then extract on the new Mac before binding launchd)
+#   - NFS export side on solid (/etc/exports must include the new Mac IP)
+
+- name: Bootstrap Mac system base
+  hosts: macmini
+  gather_facts: true
+  roles:
+    - role: mac_base
+
+- name: Bootstrap Jellyfin
+  hosts: macmini
+  gather_facts: true
+  roles:
+    - role: jellyfin_install
+
+- name: Bootstrap Emby
+  hosts: macmini
+  gather_facts: true
+  roles:
+    - role: emby_install

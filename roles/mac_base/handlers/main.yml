@@ -1,0 +1,12 @@
+---
+- name: reload automount
+  ansible.builtin.command: /usr/sbin/automount -vc
+  become: true
+
+- name: bootstrap tcp-keepalive
+  ansible.builtin.shell: |
+    /bin/launchctl bootout system/com.local.tcp-keepalive 2>/dev/null || true
+    /bin/launchctl bootstrap system {{ launchd_path }}/com.local.tcp-keepalive.plist
+  args:
+    executable: /bin/bash
+  become: true

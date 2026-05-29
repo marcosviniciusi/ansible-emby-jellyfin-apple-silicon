@@ -1,0 +1,28 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!-- {{ ansible_managed }} -->
+<!DOCTYPE plist PUBLIC '-//Apple//DTD PLIST 1.0//EN' 'http://www.apple.com/DTDs/PropertyList-1.0.dtd'>
+<plist version='1.0'>
+<dict>
+    <key>Label</key><string>{{ jellyfin_launchd_label }}</string>
+    <key>UserName</key><string>{{ jellyfin_user }}</string>
+    <key>GroupName</key><string>{{ jellyfin_group }}</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>WorkingDirectory</key><string>{{ jellyfin_data_path }}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>{{ service_path_env }}</string>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{ jellyfin_install_path }}/jellyfin</string>
+        <string>--datadir</string><string>{{ jellyfin_subdir_data }}</string>
+        <string>--configdir</string><string>{{ jellyfin_data_path }}</string>
+        <string>--cachedir</string><string>{{ jellyfin_cache_path }}</string>
+        <string>--logdir</string><string>{{ jellyfin_subdir_log }}</string>
+        <string>--ffmpeg</string><string>{{ jellyfin_ffmpeg_path }}</string>
+    </array>
+    <key>StandardOutPath</key><string>{{ jellyfin_subdir_log }}/launchd-stdout.log</string>
+    <key>StandardErrorPath</key><string>{{ jellyfin_subdir_log }}/launchd-stderr.log</string>
+</dict>
+</plist>

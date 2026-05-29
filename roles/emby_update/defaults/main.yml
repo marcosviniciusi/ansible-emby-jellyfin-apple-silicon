@@ -1,0 +1,17 @@
+---
+# =============================================================================
+#  Defaults for the `emby_update` role.
+#  Same update strategy as `jellyfin_update`. See that role for the full
+#  rationale.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Local retention policies
+#
+#  - keep_backups: how many EmbyServer.app bundles to retain in
+#    {{ backup_dir }}. Each ~ 130MB.
+#  - keep_db_backups: how many tarballs to retain in {{ db_backup_dir }}.
+#    Each ~ 150MB for Emby (gz compressed).
+# -----------------------------------------------------------------------------
+keep_backups: 3
+keep_db_backups: 5

@@ -1,0 +1,168 @@
+---
+# Standalone backup playbook — does NOT update binaries.
+# Snapshots SQLite DBs (live) + tars local config/plugins.
+# Excludes NFS-mounted dirs (cache, metadata, trickplay).
+# Use this for scheduled daily backups or before risky changes.
+
+- name: Backup Jellyfin DB + config on Mac Mini
+  hosts: macmini
+  gather_facts: true
+  vars:
+    update_ts: "{{ ansible_date_time.iso8601_basic_short }}"
+    jellyfin_installed_version: "snapshot"
+  tasks:
+    - name: "Jellyfin | Ensure DB backup dir"
+      ansible.builtin.file:
+        path: "{{ db_backup_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: wheel
+      become: true
+
+    - name: "Jellyfin | Read current version"
+      ansible.builtin.shell: |
+        if [ -x "{{ jellyfin_install_path }}/jellyfin" ]; then
+          "{{ jellyfin_install_path }}/jellyfin" --version 2>&1 | head -1 | awk '{print $NF}' | sed -E 's/\.[0-9]+$//'
+        else
+          echo "unknown"
+        fi
+      args:
+        executable: /bin/bash
+      register: jver
+      changed_when: false
+      failed_when: false
+
+    - name: "Jellyfin | Set version fact"
+      ansible.builtin.set_fact:
+        jellyfin_installed_version: "{{ jver.stdout | trim | default('unknown') }}"
+
+    - name: "Jellyfin | Snapshot + tar"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        STAGE="$(/usr/bin/mktemp -d /tmp/jellyfin-snap-XXXXXX)"
+        /bin/mkdir -p "$STAGE/data/data"
+        SRC="{{ jellyfin_data_path }}/data/data/jellyfin.db"
+        if [ -f "$SRC" ]; then
+          "{{ sqlite3_bin }}" "$SRC" ".backup '$STAGE/data/data/jellyfin.db'"
+        fi
+        /usr/bin/rsync -a \
+          --exclude='*.db' --exclude='*.db-wal' --exclude='*.db-shm' \
+          --exclude='jellyfin.db.before-*' \
+          --exclude='SQLiteBackups' \
+          --exclude='trickplay' \
+          "{{ jellyfin_data_path }}/data/data/" "$STAGE/data/data/"
+        for d in plugins root; do
+          [ -d "{{ jellyfin_data_path }}/data/$d" ] && \
+            /usr/bin/rsync -a "{{ jellyfin_data_path }}/data/$d/" "$STAGE/data/$d/"
+        done
+        /usr/bin/rsync -a \
+          --include='*.xml' --include='*.json' --include='.jellyfin-config' \
+          --exclude='*' \
+          "{{ jellyfin_data_path }}/" "$STAGE/"
+        [ -d "{{ jellyfin_data_path }}/.aspnet" ] && \
+          /usr/bin/rsync -a "{{ jellyfin_data_path }}/.aspnet/" "$STAGE/.aspnet/"
+        OUT="{{ db_backup_dir }}/jellyfin-{{ jellyfin_installed_version }}-{{ update_ts }}.tar.gz"
+        /usr/bin/tar -czf "$OUT" -C "$STAGE" .
+        /bin/chmod 0640 "$OUT"
+        /bin/rm -rf "$STAGE"
+        /bin/ls -lh "$OUT"
+      args:
+        executable: /bin/bash
+      become: true
+      register: jbk
+
+    - name: "Jellyfin | Result"
+      ansible.builtin.debug:
+        msg: "{{ jbk.stdout_lines | last }}"
+
+    - name: "Jellyfin | Push to off-machine NFS"
+      ansible.builtin.include_role:
+        name: nfs_push
+      vars:
+        nfs_push_file: "{{ db_backup_dir }}/jellyfin-{{ jellyfin_installed_version }}-{{ update_ts }}.tar.gz"
+        nfs_push_prefix: "jellyfin-"
+
+    - name: "Jellyfin | Prune old DB backups"
+      ansible.builtin.shell: |
+        cd "{{ db_backup_dir }}" && \
+        /bin/ls -1t jellyfin-*.tar.gz 2>/dev/null | tail -n +{{ keep_db_backups | int + 1 }} | \
+          while read -r f; do /bin/rm -f "{{ db_backup_dir }}/$f"; done
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+- name: Backup Emby DB + config on Mac Mini
+  hosts: macmini
+  gather_facts: true
+  vars:
+    update_ts: "{{ ansible_date_time.iso8601_basic_short }}"
+    emby_installed_version: "snapshot"
+  tasks:
+    - name: "Emby | Ensure DB backup dir"
+      ansible.builtin.file:
+        path: "{{ db_backup_dir }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: wheel
+      become: true
+
+    - name: "Emby | Read current version"
+      ansible.builtin.shell: |
+        /usr/bin/plutil -extract CFBundleVersion raw -o - "{{ emby_app_path }}/Contents/Info.plist" 2>/dev/null || echo "unknown"
+      args:
+        executable: /bin/bash
+      register: ever
+      changed_when: false
+      failed_when: false
+
+    - name: "Emby | Set version fact"
+      ansible.builtin.set_fact:
+        emby_installed_version: "{{ ever.stdout | trim | default('unknown') }}"
+
+    - name: "Emby | Snapshot + tar"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        STAGE="$(/usr/bin/mktemp -d /tmp/emby-snap-XXXXXX)"
+        /bin/mkdir -p "$STAGE/data"
+        for db in library users authentication activitylog; do
+          SRC="{{ emby_data_path }}/data/${db}.db"
+          [ -f "$SRC" ] && "{{ sqlite3_bin }}" "$SRC" ".backup '$STAGE/data/${db}.db'"
+        done
+        /usr/bin/rsync -a \
+          --exclude='*.db' --exclude='*.db-wal' --exclude='*.db-shm' \
+          "{{ emby_data_path }}/data/" "$STAGE/data/"
+        /usr/bin/rsync -a "{{ emby_data_path }}/config/"  "$STAGE/config/"
+        /usr/bin/rsync -a "{{ emby_data_path }}/plugins/" "$STAGE/plugins/"
+        OUT="{{ db_backup_dir }}/emby-{{ emby_installed_version }}-{{ update_ts }}.tar.gz"
+        /usr/bin/tar -czf "$OUT" -C "$STAGE" data config plugins
+        /bin/chmod 0640 "$OUT"
+        /bin/rm -rf "$STAGE"
+        /bin/ls -lh "$OUT"
+      args:
+        executable: /bin/bash
+      become: true
+      register: ebk
+
+    - name: "Emby | Result"
+      ansible.builtin.debug:
+        msg: "{{ ebk.stdout_lines | last }}"
+
+    - name: "Emby | Push to off-machine NFS"
+      ansible.builtin.include_role:
+        name: nfs_push
+      vars:
+        nfs_push_file: "{{ db_backup_dir }}/emby-{{ emby_installed_version }}-{{ update_ts }}.tar.gz"
+        nfs_push_prefix: "emby-"
+
+    - name: "Emby | Prune old DB backups"
+      ansible.builtin.shell: |
+        cd "{{ db_backup_dir }}" && \
+        /bin/ls -1t emby-*.tar.gz 2>/dev/null | tail -n +{{ keep_db_backups | int + 1 }} | \
+          while read -r f; do /bin/rm -f "{{ db_backup_dir }}/$f"; done
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false

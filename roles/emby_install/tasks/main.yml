@@ -1,0 +1,166 @@
+---
+# emby_install — fresh-install role. Idempotent.
+# Reads everything from group_vars; renders the plist via Jinja template.
+
+- name: "Emby install | Check if app already present"
+  ansible.builtin.stat:
+    path: "{{ emby_app_path }}/Contents/MacOS/EmbyServer"
+  become: true
+  register: emby_bin
+
+- name: "Emby install | Download + install (only if missing)"
+  when: not emby_bin.stat.exists
+  block:
+    - name: "Emby install | Query GitHub releases"
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/MediaBrowser/Emby.Releases/releases?per_page=20"
+        return_content: true
+        headers:
+          Accept: "application/vnd.github+json"
+      delegate_to: localhost
+      become: false
+      register: emby_releases
+
+    - name: "Emby install | Pick latest stable"
+      ansible.builtin.set_fact:
+        emby_latest: >-
+          {{ (emby_releases.json
+              | rejectattr('draft')
+              | selectattr('prerelease', 'equalto', false)
+              | list
+              | first) }}
+
+    - name: "Emby install | Find arm64 asset"
+      ansible.builtin.set_fact:
+        emby_asset: >-
+          {{ (emby_latest.assets
+              | selectattr('name', 'match', '^embyserver-osx-arm64-.*\.zip$')
+              | list | first) }}
+
+    - name: "Emby install | Download asset"
+      ansible.builtin.get_url:
+        url: "{{ emby_asset.browser_download_url }}"
+        dest: "/tmp/{{ emby_asset.name }}"
+        mode: "0644"
+        timeout: 120
+      delegate_to: localhost
+      become: false
+
+    - name: "Emby install | Upload to target"
+      ansible.builtin.copy:
+        src: "/tmp/{{ emby_asset.name }}"
+        dest: "/tmp/{{ emby_asset.name }}"
+        mode: "0644"
+      become: true
+
+    - name: "Emby install | Prepare staging dir"
+      ansible.builtin.file:
+        path: /tmp/emby-install-stage
+        state: absent
+      become: true
+
+    - name: "Emby install | Re-create staging dir"
+      ansible.builtin.file:
+        path: /tmp/emby-install-stage
+        state: directory
+        mode: "0755"
+      become: true
+
+    - name: "Emby install | Extract"
+      ansible.builtin.unarchive:
+        src: "/tmp/{{ emby_asset.name }}"
+        dest: /tmp/emby-install-stage
+        remote_src: true
+      become: true
+
+    - name: "Emby install | Move .app to {{ emby_app_path }}"
+      ansible.builtin.command: >
+        mv /tmp/emby-install-stage/osx-arm64/EmbyServer.app "{{ emby_app_path }}"
+      become: true
+      args:
+        creates: "{{ emby_app_path }}/Contents/MacOS/EmbyServer"
+
+    - name: "Emby install | Strip AppleDouble files"
+      ansible.builtin.shell: |
+        find "{{ emby_app_path }}" \( -name '._*' -o -name '.DS_Store' \) -delete
+      become: true
+      changed_when: false
+
+- name: "Emby install | Own as root:wheel"
+  ansible.builtin.file:
+    path: "{{ emby_app_path }}"
+    owner: root
+    group: wheel
+    recurse: true
+  become: true
+
+- name: "Emby install | Strip quarantine xattr"
+  ansible.builtin.command: xattr -dr com.apple.quarantine "{{ emby_app_path }}"
+  become: true
+  failed_when: false
+  changed_when: false
+
+- name: "Emby install | Ensure data subdirs"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ emby_user }}"
+    group: "{{ emby_group }}"
+    mode: "0755"
+  loop:
+    - "{{ emby_data_path }}"
+    - "{{ emby_subdir_data }}"
+    - "{{ emby_subdir_config }}"
+    - "{{ emby_subdir_logs }}"
+    - "{{ emby_subdir_plugins }}"
+    - "{{ emby_subdir_transcode }}"
+  become: true
+
+- name: "Emby install | Symlink cache → NFS"
+  ansible.builtin.file:
+    src: "{{ emby_cache_target_nfs }}"
+    dest: "{{ emby_cache_path }}"
+    state: link
+    force: true
+  become: true
+
+- name: "Emby install | Symlink metadata → NFS"
+  ansible.builtin.file:
+    src: "{{ emby_metadata_target_nfs }}"
+    dest: "{{ emby_metadata_path }}"
+    state: link
+    force: true
+  become: true
+
+- name: "Emby install | Render LaunchDaemon plist"
+  ansible.builtin.template:
+    src: com.embyserver.server.plist.j2
+    dest: "{{ launchd_path }}/{{ emby_launchd_label }}.plist"
+    owner: root
+    group: wheel
+    mode: "0644"
+  become: true
+  register: emby_plist
+
+- name: "Emby install | Bootstrap launchd daemon"
+  ansible.builtin.shell: |
+    /bin/launchctl bootout system/{{ emby_launchd_label }} 2>/dev/null || true
+    /bin/launchctl bootstrap system {{ launchd_path }}/{{ emby_launchd_label }}.plist
+  args:
+    executable: /bin/bash
+  become: true
+  when: emby_plist is changed or not emby_bin.stat.exists
+
+- name: "Emby install | Wait for HTTP /System/Info/Public"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ emby_port }}/System/Info/Public"
+    return_content: true
+    status_code: 200
+  register: emby_check
+  retries: "{{ (http_wait_seconds // 5) | int }}"
+  delay: 5
+  until: emby_check.status == 200
+
+- name: "Emby install | Health"
+  ansible.builtin.debug:
+    msg: "Emby OK: {{ emby_check.json.ServerName }} v{{ emby_check.json.Version }}"

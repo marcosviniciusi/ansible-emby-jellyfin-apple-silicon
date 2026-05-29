@@ -1,0 +1,24 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!-- {{ ansible_managed }} -->
+<!DOCTYPE plist PUBLIC '-//Apple//DTD PLIST 1.0//EN' 'http://www.apple.com/DTDs/PropertyList-1.0.dtd'>
+<plist version='1.0'>
+<dict>
+    <key>Label</key>
+    <string>com.local.tcp-keepalive</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/sbin/sysctl</string>
+        <string>-w</string>
+        <string>net.inet.tcp.always_keepalive={{ tcp_always_keepalive }}</string>
+        <string>net.inet.tcp.keepidle={{ tcp_keepidle_ms }}</string>
+        <string>net.inet.tcp.keepintvl={{ tcp_keepintvl_ms }}</string>
+        <string>net.inet.tcp.keepcnt={{ tcp_keepcnt }}</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/var/log/tcp-keepalive.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/tcp-keepalive.log</string>
+</dict>
+</plist>

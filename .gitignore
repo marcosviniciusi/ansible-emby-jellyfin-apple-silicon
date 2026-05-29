@@ -1,0 +1,6 @@
+*.retry
+.ansible/
+*.tar.xz
+*.zip
+.DS_Store
+.vault_pass

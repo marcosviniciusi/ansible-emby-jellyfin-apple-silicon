@@ -1,0 +1,29 @@
+---
+# =============================================================================
+#  Defaults for the `jellyfin_update` role.
+#
+#  Update strategy (idempotent):
+#    1. Query GitHub for the latest stable release
+#    2. Read installed version (`jellyfin --version`)
+#    3. If equal AND not force_update → `end_host` (no changes)
+#    4. Download the new tarball to /tmp
+#    5. Snapshot the live SQLite DB + tar local config (BEFORE stopping
+#       the daemon — if backup fails, no downtime)
+#    6. Push backup tarball to off-machine NFS (delegated to nfs_push role)
+#    7. Stop launchd
+#    8. Move old binary to {{ backup_dir }} (mv, not cp, fast and atomic)
+#    9. Install new binary
+#   10. Start launchd and wait for HTTP /System/Info/Public
+#   11. Prune old backups (keep N most recent)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Local retention policies
+#
+#  - keep_backups: how many app bundles (mv'd before swap) to retain in
+#    {{ backup_dir }}. Each is the full /opt/jellyfin tree.
+#  - keep_db_backups: how many SQLite+config tarballs to retain in
+#    {{ db_backup_dir }}. Each ~ 600M for Jellyfin (gz compressed).
+# -----------------------------------------------------------------------------
+keep_backups: 3
+keep_db_backups: 5

@@ -1,0 +1,310 @@
+---
+# Jellyfin Server update role
+# Pulls latest stable from repo.jellyfin.org (macOS arm64),
+# installs to /opt/jellyfin, restarts launchd daemon.
+
+- name: "Jellyfin | Ensure download tmp dir exists"
+  ansible.builtin.file:
+    path: "{{ download_tmp }}"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: "Jellyfin | Query GitHub for latest stable release"
+  ansible.builtin.uri:
+    url: "https://api.github.com/repos/jellyfin/jellyfin/releases/latest"
+    return_content: true
+    headers:
+      Accept: "application/vnd.github+json"
+  delegate_to: localhost
+  become: false
+  register: jellyfin_release_resp
+  check_mode: false
+
+- name: "Jellyfin | Compute target version + URL"
+  ansible.builtin.set_fact:
+    jellyfin_target_version: "{{ jellyfin_release_resp.json.tag_name | regex_replace('^v','') }}"
+
+- name: "Jellyfin | Build download URL"
+  ansible.builtin.set_fact:
+    jellyfin_asset_name: "jellyfin_{{ jellyfin_target_version }}-arm64.tar.xz"
+    jellyfin_asset_url: "https://repo.jellyfin.org/files/server/macos/latest-stable/arm64/jellyfin_{{ jellyfin_target_version }}-arm64.tar.xz"
+
+- name: "Jellyfin | Read currently installed version"
+  # Note: `jellyfin --version` exits with rc=1 even on success; do NOT use pipefail.
+  ansible.builtin.shell: |
+    if [ -x "{{ jellyfin_install_path }}/jellyfin" ]; then
+      "{{ jellyfin_install_path }}/jellyfin" --version 2>&1 | head -1 | awk '{print $NF}' | sed -E 's/\.[0-9]+$//'
+    else
+      echo "0.0.0"
+    fi
+  args:
+    executable: /bin/bash
+  register: jellyfin_installed_version_raw
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Jellyfin | Set installed version fact"
+  ansible.builtin.set_fact:
+    jellyfin_installed_version: "{{ jellyfin_installed_version_raw.stdout | trim }}"
+
+- name: "Jellyfin | Show version comparison"
+  ansible.builtin.debug:
+    msg:
+      - "Installed: {{ jellyfin_installed_version }}"
+      - "Latest:    {{ jellyfin_target_version }} (tag: {{ jellyfin_release_resp.json.tag_name }})"
+      - "URL:       {{ jellyfin_asset_url }}"
+
+- name: "Jellyfin | Skip update if already at target version"
+  ansible.builtin.meta: end_host
+  when:
+    - not force_update
+    - jellyfin_installed_version == jellyfin_target_version
+
+- name: "Jellyfin | Probe asset HEAD"
+  ansible.builtin.uri:
+    url: "{{ jellyfin_asset_url }}"
+    method: HEAD
+    status_code: [200, 302]
+  delegate_to: localhost
+  become: false
+  register: jellyfin_head
+  check_mode: false
+
+- name: "Jellyfin | Download asset to localhost"
+  ansible.builtin.get_url:
+    url: "{{ jellyfin_asset_url }}"
+    dest: "/tmp/{{ jellyfin_asset_name }}"
+    mode: "0644"
+    timeout: 120
+  delegate_to: localhost
+  become: false
+
+- name: "Jellyfin | Upload archive to target"
+  ansible.builtin.copy:
+    src: "/tmp/{{ jellyfin_asset_name }}"
+    dest: "{{ download_tmp }}/{{ jellyfin_asset_name }}"
+    mode: "0644"
+  become: true
+
+- name: "Jellyfin | Clean extraction directory"
+  ansible.builtin.file:
+    path: "{{ download_tmp }}/jellyfin-extract"
+    state: absent
+  become: true
+
+- name: "Jellyfin | Create extraction directory"
+  ansible.builtin.file:
+    path: "{{ download_tmp }}/jellyfin-extract"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: "Jellyfin | Extract archive (tar.xz)"
+  ansible.builtin.unarchive:
+    src: "{{ download_tmp }}/{{ jellyfin_asset_name }}"
+    dest: "{{ download_tmp }}/jellyfin-extract"
+    remote_src: true
+  become: true
+
+- name: "Jellyfin | Locate extracted binary"
+  ansible.builtin.shell: |
+    set -o pipefail
+    /usr/bin/find "{{ download_tmp }}/jellyfin-extract" -maxdepth 3 -type f -name jellyfin -perm -u+x | head -1
+  args:
+    executable: /bin/bash
+  become: true
+  register: jellyfin_extracted_bin
+  changed_when: false
+
+- name: "Jellyfin | Fail if binary not found"
+  ansible.builtin.fail:
+    msg: "Could not find executable 'jellyfin' inside extracted archive"
+  when: jellyfin_extracted_bin.stdout | trim == ""
+
+- name: "Jellyfin | Compute payload dir"
+  ansible.builtin.set_fact:
+    jellyfin_extracted_dir: "{{ jellyfin_extracted_bin.stdout | trim | dirname }}"
+
+- name: "Jellyfin | Ensure backup dirs exist"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: wheel
+  become: true
+  loop:
+    - "{{ backup_dir }}"
+    - "{{ db_backup_dir }}"
+
+- name: "Jellyfin | Compute timestamp"
+  ansible.builtin.set_fact:
+    update_ts: "{{ ansible_date_time.iso8601_basic_short }}"
+
+# ------------------------------------------------------------------
+# DB + config backup (local-only — NFS mounts are excluded)
+# Runs BEFORE launchd stop. sqlite3 .backup is consistent on live DB.
+# Skips:
+#   - data/data/trickplay  (symlink → NFS)
+#   - data/data/SQLiteBackups (Jellyfin's own internal backups)
+#   - data/data/jellyfin.db.before-*  (migration leftovers)
+#   - data/data/*.db / -wal / -shm   (replaced by sqlite snapshot)
+#   - cache/, log/, .temp/, lost+found/
+# ------------------------------------------------------------------
+- name: "Jellyfin | DB backup | Snapshot SQLite + tar config (local only)"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    STAGE="$(/usr/bin/mktemp -d /tmp/jellyfin-snap-XXXXXX)"
+    /bin/mkdir -p "$STAGE/data/data"
+    # SQLite live snapshot
+    SRC="{{ jellyfin_data_path }}/data/data/jellyfin.db"
+    if [ -f "$SRC" ]; then
+      "{{ sqlite3_bin }}" "$SRC" ".backup '$STAGE/data/data/jellyfin.db'"
+    fi
+    # Copy non-DB local state from data/data/ (excludes trickplay symlink,
+    # SQLiteBackups internal, live .db/-wal/-shm, and migration leftovers).
+    /usr/bin/rsync -a --copy-unsafe-links --no-l \
+      --exclude='*.db' --exclude='*.db-wal' --exclude='*.db-shm' \
+      --exclude='jellyfin.db.before-*' \
+      --exclude='SQLiteBackups' \
+      --exclude='trickplay' \
+      "{{ jellyfin_data_path }}/data/data/" "$STAGE/data/data/" 2>/dev/null || \
+    /usr/bin/rsync -a \
+      --exclude='*.db' --exclude='*.db-wal' --exclude='*.db-shm' \
+      --exclude='jellyfin.db.before-*' \
+      --exclude='SQLiteBackups' \
+      --exclude='trickplay' \
+      "{{ jellyfin_data_path }}/data/data/" "$STAGE/data/data/"
+    # Copy other local data subdirs
+    for d in plugins root; do
+      if [ -d "{{ jellyfin_data_path }}/data/$d" ]; then
+        /usr/bin/rsync -a "{{ jellyfin_data_path }}/data/$d/" "$STAGE/data/$d/"
+      fi
+    done
+    # Copy XML configs at jellyfin root (system, network, encoding, branding,
+    # database, metadata, xbmcmetadata, logging.default.json, .jellyfin-config)
+    /usr/bin/rsync -a \
+      --include='*.xml' --include='*.json' --include='.jellyfin-config' \
+      --exclude='*' \
+      "{{ jellyfin_data_path }}/" "$STAGE/"
+    # Copy .aspnet/DataProtection-Keys (auth keys)
+    if [ -d "{{ jellyfin_data_path }}/.aspnet" ]; then
+      /usr/bin/rsync -a "{{ jellyfin_data_path }}/.aspnet/" "$STAGE/.aspnet/"
+    fi
+    OUT="{{ db_backup_dir }}/jellyfin-{{ jellyfin_installed_version }}-{{ update_ts }}.tar.gz"
+    /usr/bin/tar -czf "$OUT" -C "$STAGE" .
+    /bin/chmod 0640 "$OUT"
+    /bin/rm -rf "$STAGE"
+    /bin/ls -lh "$OUT"
+  args:
+    executable: /bin/bash
+  become: true
+  register: jellyfin_db_backup
+
+- name: "Jellyfin | DB backup | Result"
+  ansible.builtin.debug:
+    msg: "{{ jellyfin_db_backup.stdout_lines | last }}"
+
+- name: "Jellyfin | DB backup | Push to off-machine NFS"
+  ansible.builtin.include_role:
+    name: nfs_push
+  vars:
+    nfs_push_file: "{{ db_backup_dir }}/jellyfin-{{ jellyfin_installed_version }}-{{ update_ts }}.tar.gz"
+    nfs_push_prefix: "jellyfin-"
+
+- name: "Jellyfin | Stop launchd daemon"
+  ansible.builtin.command: >
+    launchctl bootout system {{ launchd_path }}/{{ jellyfin_launchd_label }}.plist
+  become: true
+  register: jellyfin_stop
+  failed_when: false
+  changed_when: jellyfin_stop.rc == 0
+
+- name: "Jellyfin | Wait for process to exit"
+  ansible.builtin.shell: |
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      if ! /usr/bin/pgrep -f '/opt/jellyfin/jellyfin' >/dev/null; then exit 0; fi
+      /bin/sleep 1
+    done
+    /usr/bin/pkill -9 -f '/opt/jellyfin/jellyfin' || true
+  become: true
+  changed_when: false
+
+- name: "Jellyfin | Backup current install"
+  ansible.builtin.command: >
+    mv "{{ jellyfin_install_path }}" "{{ backup_dir }}/jellyfin.{{ jellyfin_installed_version }}.{{ update_ts }}"
+  become: true
+  args:
+    removes: "{{ jellyfin_install_path }}"
+
+- name: "Jellyfin | Install new payload to {{ jellyfin_install_path }}"
+  ansible.builtin.command: >
+    mv "{{ jellyfin_extracted_dir }}" "{{ jellyfin_install_path }}"
+  become: true
+  args:
+    creates: "{{ jellyfin_install_path }}/jellyfin"
+
+- name: "Jellyfin | chown payload to {{ jellyfin_user }}:{{ jellyfin_group }}"
+  ansible.builtin.file:
+    path: "{{ jellyfin_install_path }}"
+    owner: "{{ jellyfin_user }}"
+    group: "{{ jellyfin_group }}"
+    recurse: true
+  become: true
+
+- name: "Jellyfin | Ensure binary is executable"
+  ansible.builtin.file:
+    path: "{{ jellyfin_install_path }}/jellyfin"
+    mode: "0755"
+    owner: "{{ jellyfin_user }}"
+    group: "{{ jellyfin_group }}"
+  become: true
+
+- name: "Jellyfin | Strip quarantine xattr"
+  ansible.builtin.command: xattr -dr com.apple.quarantine "{{ jellyfin_install_path }}"
+  become: true
+  failed_when: false
+  changed_when: false
+
+- name: "Jellyfin | Start launchd daemon"
+  ansible.builtin.command: >
+    launchctl bootstrap system {{ launchd_path }}/{{ jellyfin_launchd_label }}.plist
+  become: true
+
+- name: "Jellyfin | Wait for HTTP /System/Info/Public"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ jellyfin_port }}/System/Info/Public"
+    return_content: true
+    status_code: 200
+  register: jellyfin_check
+  retries: "{{ (http_wait_seconds // 5) | int }}"
+  delay: 5
+  until: jellyfin_check.status == 200
+
+- name: "Jellyfin | Show running version"
+  ansible.builtin.debug:
+    msg: "Jellyfin is up: {{ jellyfin_check.json.ServerName }} v{{ jellyfin_check.json.Version }}"
+
+- name: "Jellyfin | Prune old app backups (keep last {{ keep_backups }})"
+  ansible.builtin.shell: |
+    set -o pipefail
+    cd "{{ backup_dir }}" && \
+    /bin/ls -1dt jellyfin.* 2>/dev/null | tail -n +{{ keep_backups | int + 1 }} | \
+      while read -r d; do /bin/rm -rf "{{ backup_dir }}/$d"; done
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false
+
+- name: "Jellyfin | Prune old DB backups (keep last {{ keep_db_backups }})"
+  ansible.builtin.shell: |
+    set -o pipefail
+    cd "{{ db_backup_dir }}" && \
+    /bin/ls -1t jellyfin-*.tar.gz 2>/dev/null | tail -n +{{ keep_db_backups | int + 1 }} | \
+      while read -r f; do /bin/rm -f "{{ db_backup_dir }}/$f"; done
+  args:
+    executable: /bin/bash
+  become: true
+  changed_when: false

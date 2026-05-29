@@ -1,0 +1,6 @@
+---
+- name: Bootstrap Mac system base (media user, /data, NFS automount, TCP keepalive)
+  hosts: macmini
+  gather_facts: true
+  roles:
+    - role: mac_base

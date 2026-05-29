@@ -1,0 +1,149 @@
+---
+# jellyfin_install — fresh-install role. Idempotent.
+# Reads everything from group_vars; renders the plist via Jinja template.
+
+- name: "Jellyfin install | Ensure ffmpeg ({{ ffmpeg_path }}) installed"
+  ansible.builtin.shell: |
+    if ! {{ ffmpeg_path }} -version >/dev/null 2>&1; then
+      {{ brew_bin }} install ffmpeg
+    fi
+  args:
+    executable: /bin/bash
+  become: false
+  changed_when: false
+
+- name: "Jellyfin install | Check if binary already present"
+  ansible.builtin.stat:
+    path: "{{ jellyfin_install_path }}/jellyfin"
+  become: true
+  register: jf_bin
+
+- name: "Jellyfin install | Download + install (only if missing)"
+  when: not jf_bin.stat.exists
+  block:
+    - name: "Jellyfin install | Query latest release"
+      ansible.builtin.uri:
+        url: "https://api.github.com/repos/jellyfin/jellyfin/releases/latest"
+        return_content: true
+        headers:
+          Accept: "application/vnd.github+json"
+      delegate_to: localhost
+      become: false
+      register: jf_release
+
+    - name: "Jellyfin install | Compute version"
+      ansible.builtin.set_fact:
+        jf_install_version: "{{ jf_release.json.tag_name | regex_replace('^v','') }}"
+
+    - name: "Jellyfin install | Download tarball"
+      ansible.builtin.get_url:
+        url: "https://repo.jellyfin.org/files/server/macos/latest-stable/arm64/jellyfin_{{ jf_install_version }}-arm64.tar.xz"
+        dest: "/tmp/jellyfin-install-{{ jf_install_version }}.tar.xz"
+        mode: "0644"
+        timeout: 120
+      delegate_to: localhost
+      become: false
+
+    - name: "Jellyfin install | Upload to target"
+      ansible.builtin.copy:
+        src: "/tmp/jellyfin-install-{{ jf_install_version }}.tar.xz"
+        dest: "/tmp/jellyfin-install-{{ jf_install_version }}.tar.xz"
+        mode: "0644"
+      become: true
+
+    - name: "Jellyfin install | Prepare staging dir"
+      ansible.builtin.file:
+        path: /tmp/jellyfin-install-stage
+        state: absent
+      become: true
+
+    - name: "Jellyfin install | Re-create staging dir"
+      ansible.builtin.file:
+        path: /tmp/jellyfin-install-stage
+        state: directory
+        mode: "0755"
+      become: true
+
+    - name: "Jellyfin install | Extract"
+      ansible.builtin.unarchive:
+        src: "/tmp/jellyfin-install-{{ jf_install_version }}.tar.xz"
+        dest: /tmp/jellyfin-install-stage
+        remote_src: true
+      become: true
+
+    - name: "Jellyfin install | Locate extracted binary"
+      ansible.builtin.shell: |
+        /usr/bin/find /tmp/jellyfin-install-stage -maxdepth 3 -type f -name jellyfin -perm -u+x | head -1
+      args:
+        executable: /bin/bash
+      become: true
+      register: jf_bin_path
+      changed_when: false
+
+    - name: "Jellyfin install | Move payload to {{ jellyfin_install_path }}"
+      ansible.builtin.command: >
+        mv "{{ jf_bin_path.stdout | trim | dirname }}" "{{ jellyfin_install_path }}"
+      become: true
+      args:
+        creates: "{{ jellyfin_install_path }}/jellyfin"
+
+- name: "Jellyfin install | Own as {{ jellyfin_user }}:{{ jellyfin_group }}"
+  ansible.builtin.file:
+    path: "{{ jellyfin_install_path }}"
+    owner: "{{ jellyfin_user }}"
+    group: "{{ jellyfin_group }}"
+    recurse: true
+  become: true
+
+- name: "Jellyfin install | Strip quarantine xattr"
+  ansible.builtin.command: xattr -dr com.apple.quarantine "{{ jellyfin_install_path }}"
+  become: true
+  failed_when: false
+  changed_when: false
+
+- name: "Jellyfin install | Ensure data subdirs"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ jellyfin_user }}"
+    group: "{{ jellyfin_group }}"
+    mode: "0755"
+  loop:
+    - "{{ jellyfin_data_path }}"
+    - "{{ jellyfin_subdir_data }}"
+    - "{{ jellyfin_subdir_log }}"
+    - "{{ jellyfin_subdir_transcode }}"
+  become: true
+
+- name: "Jellyfin install | Render LaunchDaemon plist"
+  ansible.builtin.template:
+    src: com.jellyfin.server.plist.j2
+    dest: "{{ launchd_path }}/{{ jellyfin_launchd_label }}.plist"
+    owner: root
+    group: wheel
+    mode: "0644"
+  become: true
+  register: jf_plist
+
+- name: "Jellyfin install | Bootstrap launchd daemon"
+  ansible.builtin.shell: |
+    /bin/launchctl bootout system/{{ jellyfin_launchd_label }} 2>/dev/null || true
+    /bin/launchctl bootstrap system {{ launchd_path }}/{{ jellyfin_launchd_label }}.plist
+  args:
+    executable: /bin/bash
+  become: true
+  when: jf_plist is changed or not jf_bin.stat.exists
+
+- name: "Jellyfin install | Wait for HTTP /System/Info/Public"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ jellyfin_port }}/System/Info/Public"
+    return_content: true
+    status_code: 200
+  register: jf_check
+  retries: "{{ (http_wait_seconds // 5) | int }}"
+  delay: 5
+  until: jf_check.status == 200
+
+- name: "Jellyfin install | Health"
+  ansible.builtin.debug:
+    msg: "Jellyfin OK: {{ jf_check.json.ServerName }} v{{ jf_check.json.Version }}"

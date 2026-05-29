@@ -1,0 +1,74 @@
+---
+# =============================================================================
+#  Defaults for the `emby_install` role.
+#
+#  Performs a fresh install of Emby Server on macOS arm64:
+#    1. Fetches the latest stable from
+#       https://github.com/MediaBrowser/Emby.Releases/releases
+#    2. Extracts EmbyServer.app to {{ emby_app_path }}
+#    3. Creates the data directory tree under {{ emby_data_path }}
+#    4. Symlinks cache + metadata directories to the NFS share
+#    5. Renders the LaunchDaemon plist from a Jinja template
+#    6. Bootstraps the daemon and waits for HTTP /System/Info/Public
+#
+#  Idempotent: skips download if the .app is already present.
+#  The role intentionally runs Emby with `-service` (headless, no tray
+#  icon), which is required for a LaunchDaemon environment with no user
+#  session.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+#  Bundle and data layout
+#
+#  - emby_app_path: where the .app bundle is dropped. /Applications is the
+#    canonical macOS location and what Emby expects.
+#  - emby_data_path: programdata directory. Passed via `-programdata` on
+#    the command line. Holds DBs, config XML, plugins, logs.
+# -----------------------------------------------------------------------------
+emby_app_path: /Applications/EmbyServer.app
+emby_data_path: /var/lib/emby
+
+# -----------------------------------------------------------------------------
+#  launchd identity and HTTP port
+# -----------------------------------------------------------------------------
+emby_launchd_label: com.embyserver.server
+emby_port: 8096
+
+# -----------------------------------------------------------------------------
+#  Service identity
+# -----------------------------------------------------------------------------
+emby_user: "{{ media_user }}"
+emby_group: "{{ media_group }}"
+
+# -----------------------------------------------------------------------------
+#  Derived data subdirectories
+#
+#  Emby uses a single programdata root with subdirs. The plist sets
+#  `HOME` to programdata so plugins that read $HOME stay sandboxed.
+# -----------------------------------------------------------------------------
+emby_subdir_data: "{{ emby_data_path }}/data"            # SQLite DBs + state
+emby_subdir_config: "{{ emby_data_path }}/config"        # system.xml + users/
+emby_subdir_logs: "{{ emby_data_path }}/logs"            # daemon + ffmpeg logs
+emby_subdir_plugins: "{{ emby_data_path }}/plugins"      # plugin binaries
+emby_subdir_transcode: "{{ emby_data_path }}/transcoding-temp"   # LOCAL SSD
+
+# -----------------------------------------------------------------------------
+#  NFS-backed paths (symlinks)
+#
+#  Unlike Jellyfin (which accepts --cachedir on the command line), Emby
+#  always reads cache/metadata from <programdata>/cache and
+#  <programdata>/metadata. To put them on NFS we replace those directories
+#  with symlinks pointing at the NFS mount.
+# -----------------------------------------------------------------------------
+emby_cache_path: "{{ emby_data_path }}/cache"            # symlink path
+emby_metadata_path: "{{ emby_data_path }}/metadata"      # symlink path
+emby_cache_target_nfs: "{{ nfs_midia_mount }}/emby/cache"
+emby_metadata_target_nfs: "{{ nfs_midia_mount }}/emby/metadata"
+
+# -----------------------------------------------------------------------------
+#  Process resource limit
+#
+#  Default macOS NumberOfFiles soft limit is low (~256). Emby opens many
+#  file handles when scanning large libraries; bump to 65536.
+# -----------------------------------------------------------------------------
+emby_softlimit_nofiles: 65536
