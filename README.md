@@ -8,10 +8,6 @@ remote NFS server.
 > - ✅ Bootstrap — install from scratch on a clean macOS host
 > - ✅ Updates — pull the latest release, atomic binary swap, health check
 > - ✅ Backups — SQLite + config snapshots, pushed off-machine to NFS
->
-> **What it does NOT cover (manual or future):**
-> - ❌ Restoring a DB from a backup tarball
-> - ❌ Migrating data from a Kubernetes PVC
 
 ---
 
