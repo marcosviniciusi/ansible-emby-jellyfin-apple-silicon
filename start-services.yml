@@ -1,0 +1,106 @@
+---
+# Mount NFS shares and start Jellyfin + Emby.
+#
+# Counterpart to stop-services.yml. Run this after the NFS server is back
+# online (or after maintenance) to bring the stack back up.
+#
+# Sequence:
+#   1) Reload automount (re-read /etc/auto_nfs, in case it was touched)
+#   2) Trigger autofs by stat-ing the mount points
+#   3) Verify both NFS mounts are present
+#   4) Bootstrap Jellyfin + Emby LaunchDaemons
+#   5) Wait for HTTP /System/Info/Public on both
+#
+# Assumes /etc/auto_nfs and the LaunchDaemon plists are already in place
+# (i.e. mac_base, jellyfin_install, emby_install have already run).
+
+- name: Mount NFS shares and start Emby + Jellyfin
+  hosts: macmini
+  gather_facts: false
+
+  tasks:
+    - name: "start | Reload automount (-vc)"
+      ansible.builtin.command: /usr/sbin/automount -vc
+      become: true
+      changed_when: false
+
+    - name: "start | Trigger autofs by listing each mount point"
+      ansible.builtin.shell: |
+        /bin/ls "{{ item }}" >/dev/null 2>&1 || true
+      args:
+        executable: /bin/bash
+      loop:
+        - "{{ videos_mount }}"
+        - "{{ nfs_midia_mount }}"
+      become: true
+      changed_when: false
+
+    - name: "start | Wait for {{ videos_mount }} to be NFS-mounted"
+      ansible.builtin.shell: |
+        /sbin/mount | grep -q " on {{ videos_mount }} .* nfs"
+      args:
+        executable: /bin/bash
+      become: true
+      register: videos_mounted
+      retries: 12
+      delay: 5
+      until: videos_mounted.rc == 0
+      changed_when: false
+
+    - name: "start | Wait for {{ nfs_midia_mount }} to be NFS-mounted"
+      ansible.builtin.shell: |
+        /sbin/mount | grep -q " on {{ nfs_midia_mount }} .* nfs"
+      args:
+        executable: /bin/bash
+      become: true
+      register: midia_mounted
+      retries: 12
+      delay: 5
+      until: midia_mounted.rc == 0
+      changed_when: false
+
+    - name: "start | Bootstrap Jellyfin LaunchDaemon"
+      ansible.builtin.shell: |
+        /bin/launchctl bootout system/{{ jellyfin_launchd_label }} 2>/dev/null || true
+        /bin/launchctl bootstrap system {{ launchd_path }}/{{ jellyfin_launchd_label }}.plist
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+    - name: "start | Bootstrap Emby LaunchDaemon"
+      ansible.builtin.shell: |
+        /bin/launchctl bootout system/{{ emby_launchd_label }} 2>/dev/null || true
+        /bin/launchctl bootstrap system {{ launchd_path }}/{{ emby_launchd_label }}.plist
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+    - name: "start | Wait for Jellyfin HTTP /System/Info/Public"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ jellyfin_port }}/System/Info/Public"
+        return_content: true
+        status_code: 200
+      register: jf_check
+      retries: "{{ (http_wait_seconds // 5) | int }}"
+      delay: 5
+      until: jf_check.status == 200
+
+    - name: "start | Wait for Emby HTTP /System/Info/Public"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ emby_port }}/System/Info/Public"
+        return_content: true
+        status_code: 200
+      register: emby_check
+      retries: "{{ (http_wait_seconds // 5) | int }}"
+      delay: 5
+      until: emby_check.status == 200
+
+    - name: "start | Summary"
+      ansible.builtin.debug:
+        msg:
+          - "NFS {{ videos_mount }}:    mounted"
+          - "NFS {{ nfs_midia_mount }}: mounted"
+          - "Jellyfin OK: {{ jf_check.json.ServerName }} v{{ jf_check.json.Version }}"
+          - "Emby OK:     {{ emby_check.json.ServerName }} v{{ emby_check.json.Version }}"

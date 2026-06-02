@@ -1,0 +1,85 @@
+---
+# Stop Jellyfin + Emby and unmount the NFS shares.
+#
+# Use this for maintenance windows (NFS server reboot, network move, etc).
+# Safe to re-run: launchctl bootout and umount are tolerant when the target
+# is already absent.
+#
+# Sequence:
+#   1) Bootout Emby + Jellyfin LaunchDaemons (stops the processes)
+#   2) Wait for HTTP listeners to actually disappear
+#   3) Unmount /data/videos and /data/nfs-midia
+#
+# autofs will re-mount on access, so you must stop the services FIRST.
+# The /etc/auto_nfs map is left intact — start-services.yml just triggers
+# automount again.
+
+- name: Stop Emby + Jellyfin and unmount NFS shares
+  hosts: macmini
+  gather_facts: false
+
+  tasks:
+    - name: "stop | Bootout Emby LaunchDaemon"
+      ansible.builtin.shell: |
+        /bin/launchctl bootout system/{{ emby_launchd_label }} 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+    - name: "stop | Bootout Jellyfin LaunchDaemon"
+      ansible.builtin.shell: |
+        /bin/launchctl bootout system/{{ jellyfin_launchd_label }} 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      become: true
+      changed_when: false
+
+    - name: "stop | Wait for Emby HTTP to go down"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ emby_port }}/System/Info/Public"
+        status_code: [-1, 502, 503, 504]
+      register: emby_down
+      retries: 12
+      delay: 5
+      until: emby_down.status in [-1, 502, 503, 504]
+      failed_when: false
+
+    - name: "stop | Wait for Jellyfin HTTP to go down"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ jellyfin_port }}/System/Info/Public"
+        status_code: [-1, 502, 503, 504]
+      register: jf_down
+      retries: 12
+      delay: 5
+      until: jf_down.status in [-1, 502, 503, 504]
+      failed_when: false
+
+    - name: "stop | Unmount NFS shares (autofs)"
+      ansible.builtin.shell: |
+        if /sbin/mount | grep -q " on {{ item }} "; then
+          /sbin/umount "{{ item }}" || /sbin/umount -f "{{ item }}"
+        fi
+      args:
+        executable: /bin/bash
+      loop:
+        - "{{ videos_mount }}"
+        - "{{ nfs_midia_mount }}"
+      become: true
+      changed_when: false
+
+    - name: "stop | Show remaining NFS mounts (should be empty)"
+      ansible.builtin.shell: |
+        /sbin/mount | grep -E ' type nfs| nfs ' || echo "no nfs mounts"
+      args:
+        executable: /bin/bash
+      become: true
+      register: remaining
+      changed_when: false
+
+    - name: "stop | Summary"
+      ansible.builtin.debug:
+        msg:
+          - "Emby:     stopped (last HTTP status: {{ emby_down.status | default('n/a') }})"
+          - "Jellyfin: stopped (last HTTP status: {{ jf_down.status | default('n/a') }})"
+          - "NFS mounts: {{ remaining.stdout }}"

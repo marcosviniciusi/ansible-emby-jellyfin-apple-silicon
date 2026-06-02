@@ -2,6 +2,95 @@
 # mac_base — system-level prep for a fresh Mac Mini.
 # All values come from group_vars; templates render the actual file content.
 
+# =============================================================================
+#  Toolchain bootstrap (Xcode CLT + Homebrew)
+#
+#  Runs first because everything below (and the install roles that come
+#  after mac_base) depends on /opt/homebrew. Idempotent: skips if CLT and
+#  brew are already present.
+# =============================================================================
+
+- name: "mac_base | Check Xcode Command Line Tools"
+  ansible.builtin.command: /usr/bin/xcode-select -p
+  register: clt_check
+  failed_when: false
+  changed_when: false
+
+- name: "mac_base | Install Xcode Command Line Tools (unattended)"
+  # The softwareupdate trick: touch the trigger file that exposes CLT in
+  # the update catalog, find the highest-version CLT label, then install
+  # it. Takes 5-15 minutes on a fresh Mac.
+  ansible.builtin.shell: |
+    set -euo pipefail
+    TRIGGER=/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+    /usr/bin/touch "$TRIGGER"
+    CLT_LABEL=$(/usr/sbin/softwareupdate -l 2>&1 \
+      | /usr/bin/awk -F'Label: ' '/\* Label:.*Command Line Tools/ {print $2}' \
+      | /usr/bin/sort -V | /usr/bin/tail -1)
+    if [ -z "$CLT_LABEL" ]; then
+      echo "ERROR: no Command Line Tools package found in softwareupdate catalog" >&2
+      /bin/rm -f "$TRIGGER"
+      exit 1
+    fi
+    /usr/sbin/softwareupdate -i "$CLT_LABEL" --verbose
+    /bin/rm -f "$TRIGGER"
+  args:
+    executable: /bin/bash
+  become: true
+  when: clt_check.rc != 0
+  register: clt_install
+  changed_when: clt_install.rc == 0
+
+- name: "mac_base | Verify Xcode CLT installed"
+  ansible.builtin.command: /usr/bin/xcode-select -p
+  changed_when: false
+
+- name: "mac_base | Check Homebrew at {{ brew_bin }}"
+  ansible.builtin.stat:
+    path: "{{ brew_bin }}"
+  register: brew_check
+
+- name: "mac_base | Pre-create /opt/homebrew owned by {{ brew_install_user }}"
+  # Pre-creating with the right ownership lets the brew installer skip its
+  # `sudo chown` step, which is the only thing it would prompt for under
+  # NONINTERACTIVE=1.
+  ansible.builtin.file:
+    path: /opt/homebrew
+    state: directory
+    owner: "{{ brew_install_user }}"
+    group: "{{ brew_install_group }}"
+    mode: "0755"
+  become: true
+  when: not brew_check.stat.exists
+
+- name: "mac_base | Install Homebrew (NONINTERACTIVE, as {{ brew_install_user }})"
+  ansible.builtin.shell: |
+    /bin/bash -c "$(/usr/bin/curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  args:
+    executable: /bin/bash
+    creates: "{{ brew_bin }}"
+  become: false
+  environment:
+    NONINTERACTIVE: "1"
+    CI: "1"
+    HOMEBREW_NO_ANALYTICS: "1"
+    HOMEBREW_NO_AUTO_UPDATE: "1"
+  when: not brew_check.stat.exists
+
+- name: "mac_base | Verify Homebrew works"
+  ansible.builtin.command: "{{ brew_bin }} --version"
+  become: false
+  register: brew_version
+  changed_when: false
+
+- name: "mac_base | Homebrew version"
+  ansible.builtin.debug:
+    msg: "{{ brew_version.stdout_lines | first }}"
+
+# =============================================================================
+#  System configuration (hostname, users, autofs, keepalive)
+# =============================================================================
+
 - name: "mac_base | Set hostname to '{{ mac_hostname }}' (ComputerName + HostName + LocalHostName)"
   ansible.builtin.shell: |
     /usr/sbin/scutil --set ComputerName  "{{ mac_hostname }}"

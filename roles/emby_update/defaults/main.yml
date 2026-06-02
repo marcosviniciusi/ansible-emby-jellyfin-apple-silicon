@@ -13,5 +13,5 @@
 #  - keep_db_backups: how many tarballs to retain in {{ db_backup_dir }}.
 #    Each ~ 150MB for Emby (gz compressed).
 # -----------------------------------------------------------------------------
-keep_backups: 3
-keep_db_backups: 5
+keep_backups: 10
+keep_db_backups: 10

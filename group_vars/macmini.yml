@@ -25,6 +25,50 @@ media_user: media
 media_group: media
 media_uid: 10000
 media_gid: 10000
+media_realname: "Media Server"   # cosmetic display name in DirectoryServices
+
+# -----------------------------------------------------------------------------
+#  Mac hostname (set on ComputerName + HostName + LocalHostName).
+#  Empty string = keep whatever the Mac already has.
+# -----------------------------------------------------------------------------
+mac_hostname: media01
+
+# -----------------------------------------------------------------------------
+#  /etc/synthetic.conf target for the /data symlink.
+#  Points at the writable data volume (macOS root is read-only since Catalina).
+#  CHANGES REQUIRE A REBOOT — synthetic.conf is only re-read at boot.
+# -----------------------------------------------------------------------------
+data_root_target: System/Volumes/Data/data
+
+# -----------------------------------------------------------------------------
+#  NFS mount options used in /etc/auto_nfs.
+#  vers=4 is required; do NOT add `nolocks` (incompatible with NFSv4 on macOS,
+#  causes "Invalid argument" mount failures).
+#  Append `,hard,intr,timeo=600,retrans=2` for resilience against transient
+#  NFS server pauses if needed.
+# -----------------------------------------------------------------------------
+nfs_mount_opts_ro: "vers=4,ro"
+nfs_mount_opts_rw: "vers=4,rw"
+
+# -----------------------------------------------------------------------------
+#  TCP keepalive sysctls (mac_base role applies these at boot + immediately).
+#
+#  Why: NFS-over-TCP idles. When it crosses a stateful firewall the state
+#  table entry expires after N seconds of silence and the next packet drops
+#  ("NFS server not responding"). macOS defaults are too lax:
+#    - always_keepalive=0 (apps must opt in via SO_KEEPALIVE — most don't)
+#    - keepidle=2h        (first probe fires way after firewall state expires)
+#
+#  Defaults below: keepalive forced on every socket, first probe after 2 min,
+#  retry every 30s up to 8 times. Firewall state refreshed ~every 2 min,
+#  dead server detected in ~4 min.
+#
+#  Tune lower if your firewall has very short idle timeouts.
+# -----------------------------------------------------------------------------
+tcp_always_keepalive: 1        # 0=off, 1=force keepalive on every TCP socket
+tcp_keepidle_ms: 120000        # idle ms before first probe
+tcp_keepintvl_ms: 30000        # ms between probes
+tcp_keepcnt: 8                 # probes before declaring connection dead
 
 # -----------------------------------------------------------------------------
 #  Primary NFS server (the storage box on the LAN).
@@ -83,12 +127,23 @@ brew_bin: /opt/homebrew/bin/brew
 sqlite3_bin: /usr/bin/sqlite3
 launchd_path: /Library/LaunchDaemons
 
+# -----------------------------------------------------------------------------
+#  User that owns the Homebrew install.
+#
+#  Homebrew refuses to run as root and needs an admin user to manage
+#  /opt/homebrew. Default = the connecting SSH user (already an admin since
+#  we use sudo). Override here if you want brew owned by a different account
+#  (e.g. a dedicated "brewadmin" user).
+# -----------------------------------------------------------------------------
+brew_install_user: "{{ ansible_user }}"
+brew_install_group: admin
+
 # PATH used by LaunchDaemons (Homebrew bin first so jellyfin can find ffmpeg)
 service_path_env: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # -----------------------------------------------------------------------------
 #  Shared operational settings.
-#  Used by update + backup + nfs_push roles.
+#  Used by update + backup + nfs_push + stop/start roles.
 # -----------------------------------------------------------------------------
 backup_dir: /var/backups/mac-media                # local backup root
 db_backup_dir: "{{ backup_dir }}/db"              # local DB tarball subdir
@@ -99,21 +154,45 @@ http_wait_seconds: 90                              # daemon health-check timeout
 force_update: false        # if true, reinstall even when versions match
 include_prereleases: false # Emby: also consider beta releases
 
-# Backup retention (how many DB backup tarballs to keep)
-keep_db_backups: 10
+# Backup retention
+keep_backups: 3            # how many app bundles to retain locally per service
+keep_db_backups: 10        # how many DB+config tarballs to keep locally
 
 # -----------------------------------------------------------------------------
-#  Jellyfin installation paths.
-#  These match the defaults in roles/jellyfin_install/defaults/main.yml but
-#  are needed by backup-only.yml which doesn't include that role.
+#  Off-machine backup (nfs_push role).
+#  nfs_backup_server + nfs_backup_export (above) already define WHERE to push;
+#  these control the push behaviour itself.
+# -----------------------------------------------------------------------------
+nfs_backup_enabled: true                  # set false to skip pushing backups to NFS
+nfs_backup_mount: /private/tmp/nfs-backup # temp mountpoint (RW, not under SIP)
+nfs_backup_remote_subdir: db              # subdir under the NFS export
+keep_remote_db_backups: 30                # tarballs to keep off-machine
+
+# -----------------------------------------------------------------------------
+#  Jellyfin service identity + paths.
+#
+#  These mirror the defaults in roles/jellyfin_install/defaults/main.yml
+#  but live here so they are available to any standalone playbook
+#  (backup-only.yml, update-jellyfin.yml, stop/start-services.yml) that
+#  does NOT include the jellyfin_install role.
+#
+#  Single source of truth: if you change a value here, the install role
+#  picks it up automatically because its defaults are shadowed by group_vars.
 # -----------------------------------------------------------------------------
 jellyfin_install_path: /opt/jellyfin
 jellyfin_data_path: /var/lib/jellyfin
+jellyfin_launchd_label: com.jellyfin.server
+jellyfin_port: 8097                           # 8096 conflicts with Emby
+jellyfin_user: "{{ media_user }}"
+jellyfin_group: "{{ media_group }}"
 
 # -----------------------------------------------------------------------------
-#  Emby installation paths.
-#  These match the defaults in roles/emby_install/defaults/main.yml but
-#  are needed by backup-only.yml which doesn't include that role.
+#  Emby service identity + paths.
+#  Same rationale as the Jellyfin block above.
 # -----------------------------------------------------------------------------
 emby_app_path: /Applications/EmbyServer.app
 emby_data_path: /var/lib/emby
+emby_launchd_label: com.embyserver.server
+emby_port: 8096
+emby_user: "{{ media_user }}"
+emby_group: "{{ media_group }}"

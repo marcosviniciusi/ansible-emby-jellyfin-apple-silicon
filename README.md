@@ -117,8 +117,10 @@ ansible-mac-emby-jelly/
 │                                   # tooling paths, identity)
 ├── Makefile                         # all interaction goes through `make`
 │
-├── bootstrap.yml                    # FRESH INSTALL: base + jellyfin + emby
-├── bootstrap-base.yml               #   system base only
+├── preflight.yml                    # HOST READINESS: FileVault, sudo, NFS reachable
+│
+├── bootstrap.yml                    # FRESH INSTALL: preflight + base + jellyfin + emby
+├── bootstrap-base.yml               #   system base only (incl. CLT + Homebrew)
 ├── bootstrap-jellyfin.yml           #   Jellyfin only
 ├── bootstrap-emby.yml               #   Emby only
 │
@@ -126,6 +128,8 @@ ansible-mac-emby-jelly/
 ├── update-jellyfin.yml
 ├── update-emby.yml
 ├── backup-only.yml                  # OPS: backup without updating
+├── stop-services.yml                # OPS: stop daemons + unmount NFS (maintenance)
+├── start-services.yml               # OPS: mount NFS + start daemons (recovery)
 │
 └── roles/
     ├── mac_base/                    # system base
@@ -160,6 +164,28 @@ ansible-mac-emby-jelly/
         └── tasks/main.yml
 ```
 
+### Make targets (quick reference)
+
+Every interaction goes through `make <target>` — see `make help` for the
+full list. Most-used:
+
+| Target | What it does |
+|---|---|
+| `make ping` | Smoke test SSH + sudo |
+| `make preflight` | Verify host readiness (FileVault, sudo, NFS reachable, power settings) |
+| `make ssh-key` | One-time: copy controller's SSH pubkey to the Mac |
+| `make bootstrap` | Full from-scratch install (auto-runs preflight first) |
+| `make bootstrap-base` | System base only (user, autofs, Homebrew). **Requires reboot afterwards.** |
+| `make bootstrap-jelly` / `bootstrap-emby` | One service only |
+| `make check` | Dry-run update version check (no changes) |
+| `make update-all` | Update both Jellyfin and Emby if newer is out (+ DB backup) |
+| `make update-jellyfin` / `update-emby` | One service only |
+| `make force-jellyfin` / `force-emby` | Reinstall even when on latest |
+| `make backup` | DB+config snapshot, no binary swap |
+| `make stop-services` | Stop daemons + unmount NFS (maintenance window) |
+| `make start-services` | Mount NFS + start daemons (recovery from maintenance) |
+| `make list-backups` / `list-db-backups` / `list-remote-backups` | List backups (local / DB tarballs / off-machine on NFS) |
+
 ### Variable layout
 
 All values are split between two places:
@@ -182,38 +208,177 @@ roles/<role>/defaults/main.yml
 
 ## Prerequisites
 
-### On the controller (your workstation, where Ansible runs)
+The setup involves three machines: a **controller** (where you run
+Ansible), the **target Mac** (where the media servers run), and the
+**NFS server** (where media + backups live). Every prereq below maps to
+one of those three.
+
+If you only want the short version: skip to
+[Bootstrap (install from scratch)](#bootstrap-install-from-scratch),
+then come back if `make preflight` fails.
+
+---
+
+### 1. Hardware
+
+| | Requirement |
+|---|---|
+| Mac model | Apple Silicon (M1 / M2 / M3 / M4 — anything **arm64**). Intel Macs work in principle but `ffmpeg_path` and `brew_bin` need overriding, and `softwareupdate` install of CLT may diverge. |
+| RAM | 8 GB minimum (16 GB+ if you transcode 4K) |
+| Local SSD free space | ≥ 50 GB free for SQLite DBs, transcoding-temp, app bundles, and the rolling local backup tarballs (`/var/backups/mac-media`) |
+| NFS server | Any Linux distro with NFSv4 support (kernel 3.10+). FreeBSD/Solaris work too. macOS-as-NFS-server is not tested. |
+
+---
+
+### 2. On the controller (your workstation)
 
 ```bash
 brew install ansible sshpass
 ```
 
-`sshpass` is only needed for the first connection. After `make ssh-key` your
-SSH public key is installed on the Mac and password auth becomes optional
-(`sudo` still needs the password — see Credentials section).
+Detailed list:
 
-### On the target Mac
+| Tool | Why | Tested version |
+|---|---|---|
+| `ansible-core` | runs the playbooks | 2.16+ |
+| `sshpass` | one-shot password push for `make ssh-key`. Not used after key is installed. | any |
+| `git` | clone this repo | any |
+| `/bin/bash` | the Makefile + a few inline shells use bashisms | any modern bash |
+| `make` | every interaction goes through `make <target>` | any |
+| `python3` | for Ansible itself; Homebrew installs it as a dep of `ansible-core` | 3.10+ |
 
-1. **macOS installed** (tested on Sequoia 15.x arm64; should work on any
-   recent macOS).
-2. **SSH enabled**: System Settings → General → Sharing → Remote Login →
-   Allow All Users.
-3. **Homebrew installed**:
-   ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-   ```
-4. **ffmpeg installed via Homebrew** (Jellyfin needs it):
-   ```bash
-   brew install ffmpeg
-   ```
-   The role will run this for you if missing, but it's faster to do it once
-   by hand.
-5. **The admin user's password** in hand to export as `MAC_PASSWORD` for
-   sudo escalation.
+No external Ansible collections are required — every task uses
+`ansible.builtin.*`.
 
-### On the NFS server (Linux example)
+**Controller → Mac connectivity**: TCP/22 (SSH) must be reachable from
+the controller to the Mac. If they're on different subnets, make sure
+your firewall rules permit it.
 
-`/etc/exports` must include three entries authorizing the Mac's IP:
+---
+
+### 3. On the target Mac
+
+This is a **headless server** setup. macOS defaults assume a desktop user
+at a keyboard, so a few settings have to change before bootstrap. The
+[`preflight.yml`](preflight.yml) playbook verifies the hard requirements
+automatically — run `make preflight` any time to get a status report.
+
+#### 3.1 macOS version + architecture
+
+| Item | Requirement |
+|---|---|
+| macOS version | Sequoia 15.x tested. Sonoma 14.x and Ventura 13.x should work (no version-gated APIs are used). |
+| Architecture | **arm64**. Hard fail if `uname -m` returns anything else. |
+| User-facing setup wizard | Complete it once (create the admin account, accept the EULA). The Mac must reach the login screen before Ansible can SSH in. |
+
+#### 3.2 Administrator user account
+
+The connecting SSH user must:
+
+| | Why |
+|---|---|
+| Be a member of the `admin` group | Required for `sudo` (which every privileged task uses) AND for Homebrew to chown `/opt/homebrew`. |
+| Have a real password (not Touch-ID only) | `MAC_PASSWORD` env var is passed to `ansible_become_password`. Touch ID can't satisfy a non-interactive `sudo`. |
+| Know its own password | You'll set it in `MAC_PASSWORD` on the controller. |
+
+To verify:
+
+```bash
+ssh <admin_user>@<mac_ip> 'id -Gn | grep -wq admin && echo ok'
+```
+
+#### 3.3 macOS system settings (manual, before bootstrap)
+
+These can't be set by Ansible because they require interactive UI confirmations or affect the very transport Ansible would use.
+
+| Setting | Where | Required value | Why |
+|---|---|---|---|
+| **Remote Login (SSH)** | System Settings → General → Sharing → Remote Login | **On**, Allow access for: All users (or just the admin user) | Ansible's transport. Without this nothing works. |
+| **FileVault** | System Settings → Privacy & Security → FileVault | **Off** | Headless boot can't unlock the disk → LaunchDaemons never start. Disable BEFORE you start; decryption can take hours. |
+| **Automatic login** | System Settings → Users & Groups → Automatic login | Off (default) | All services run as system LaunchDaemons; no GUI session is needed. |
+| **Screen Lock** | System Settings → Lock Screen | Anything | Doesn't matter for daemons. Set to whatever fits your physical access model. |
+| **Software Update → Auto-install macOS updates** | System Settings → General → Software Update | Up to you | Recommend **off** — surprise reboots break running streams. Update on a maintenance window. |
+| **Wake on network access** | System Settings → Energy / Lock Screen | On | Lets you wake the Mac for maintenance with WoL. Equivalent to `pmset womp 1`. |
+
+#### 3.4 macOS settings auto-checked by preflight
+
+Preflight will **hard-fail** if any of these are wrong. Fix before re-running:
+
+- Architecture is arm64
+- `sudo` works (i.e. `MAC_PASSWORD` is valid and the user is in the `admin` group)
+- FileVault is OFF
+
+Preflight will **warn** (not block) on:
+
+- `pmset` not set to `sleep=0`, `autorestart=1`, `womp=1` — fix with
+  `sudo pmset -a sleep 0 disksleep 0 autorestart 1 powernap 0 womp 1`
+- NFS server unreachable on TCP/2049 — fix the network / firewall / exports
+
+Preflight will **report (info-only)**:
+
+- SIP status — expected to be **enabled** (this project does NOT need SIP off)
+- Xcode CLT — installed automatically by `mac_base` if missing
+- Homebrew — installed automatically by `mac_base` if missing
+- ffmpeg — installed by `jellyfin_install` if missing
+- `/data` symlink state — only exists after the first `bootstrap-base` + reboot
+
+#### 3.5 Installed automatically by `mac_base` (no action needed)
+
+These used to be manual steps; they now run as part of `make bootstrap`.
+You can pre-install any of them if you want (it just makes the first
+bootstrap slightly faster), but you don't have to.
+
+| Auto-installed thing | How | Time on a fresh Mac |
+|---|---|---|
+| Xcode Command Line Tools | `softwareupdate -i` via the `.com.apple.dt.CommandLineTools.installondemand.in-progress` trigger trick | 5-15 min |
+| Homebrew | `NONINTERACTIVE=1` install script, run as `brew_install_user` (default = the connecting SSH user). `/opt/homebrew` is pre-created with the right ownership so the installer never prompts for sudo. | 2-5 min |
+| ffmpeg | `brew install ffmpeg` (in the `jellyfin_install` role) | 1-2 min |
+
+#### 3.6 Things to leave alone
+
+| Setting | Recommended | Why |
+|---|---|---|
+| **SIP (System Integrity Protection)** | **Enabled** (macOS default) | This project only writes to non-SIP paths (`/etc/synthetic.conf`, `/etc/auto_master`, `/Library/LaunchDaemons`, `/Applications`, `/opt`, `/var/lib`, `/private`). Disabling SIP would weaken the system without any benefit. |
+| **Gatekeeper** | Enabled | The roles strip `com.apple.quarantine` xattr from downloaded binaries automatically. |
+| **/usr/bin/python3 shim** | Don't replace | Used by `ansible_python_interpreter`. The CLT install provides the real binary behind the shim. |
+
+#### 3.7 Network on the Mac
+
+| | Recommendation |
+|---|---|
+| IP address | **Static or DHCP reservation**. `inventory.yml` hard-codes the Mac's IP (`ansible_host`); a roaming IP breaks Ansible. |
+| Outbound to internet | Required during bootstrap/update: `api.github.com`, `repo.jellyfin.org`, `raw.githubusercontent.com` (for Homebrew installer), `*.brew.sh`, Apple update servers. |
+| Inbound TCP/22 (SSH) | From the controller's IP |
+| Inbound TCP/8096 | From clients that watch Emby |
+| Inbound TCP/8097 | From clients that watch Jellyfin |
+| Outbound TCP/2049 (NFS) | To the NFS server |
+
+#### 3.8 Verify everything
+
+```bash
+make preflight
+```
+
+`make bootstrap` runs preflight automatically before anything else, so a
+fresh install can't accidentally start on an unready host.
+
+---
+
+### 4. On the NFS server (Linux example)
+
+#### 4.1 Server software
+
+| | Requirement |
+|---|---|
+| Kernel | NFSv4 support (Linux 3.10+) |
+| `nfs-utils` (Linux) | `exportfs`, `rpc.nfsd` |
+| NFSv4 enabled | Default on modern distros. Verify with `cat /proc/fs/nfsd/versions` shows `+4`. |
+| Firewall | TCP/2049 reachable from the Mac's IP |
+| Filesystem under `/export` | XFS or ext4 recommended; ZFS works fine |
+
+#### 4.2 Required exports
+
+`/etc/exports` must include four entries authorizing the Mac's IP:
 
 ```
 /export                <mac_ip>(sync,ro,insecure,root_squash,fsid=0)
@@ -226,14 +391,67 @@ SSH public key is installed on the Mac and password auth becomes optional
 ```
 
 Important notes:
-- `fsid=0` on `/export` is the NFSv4 pseudoroot. Without it the Mac mount
-  fails with "Invalid argument".
+- `fsid=0` on `/export` is the **NFSv4 pseudoroot**. Without it the Mac
+  mount fails with "Invalid argument".
 - `anonuid/anongid=10000` map all writes to the `media` user (uid 10000),
-  which matches the user this Ansible setup creates on the Mac. Adjust if
-  you change `media_uid`/`media_gid` in `group_vars`.
+  which matches the user this setup creates on the Mac. Change both
+  sides together if you change `media_uid`/`media_gid` in `group_vars`.
 - Replace each `fsid=...` with a unique UUID per export (`uuidgen`).
 - After editing: `sudo exportfs -ra` (no `systemctl restart` needed for
   exports-only changes).
+- Filesystem ownership under each export should match — `chown -R 10000:10000`
+  the `nfs-midia` and `dmz3-backup` trees so the Mac (mapped to uid 10000)
+  can write.
+
+#### 4.3 Required directory layout
+
+The Mac expects to find these subdirectories under the NFS exports
+(the roles create them on first run, but the parent dirs must be
+writable):
+
+```
+/export/nfs-midia/
+  ├── jellyfin/{cache,metadata,trickplay}    # created by jellyfin_install
+  └── emby/{cache,metadata}                  # created by emby_install
+
+/export/dmz3-backup/
+  └── db/                                    # created by nfs_push role
+```
+
+---
+
+### 5. Network / firewall (between subnets)
+
+If the controller, Mac, and NFS server are on different subnets, you
+need rules permitting:
+
+| Source | Destination | Port | Purpose |
+|---|---|---|---|
+| Controller | Mac | TCP/22 | Ansible SSH |
+| Mac | NFS server | TCP/2049 | NFS traffic |
+| Mac | Internet | TCP/443 | GitHub + Homebrew + Apple updates |
+| Clients | Mac | TCP/8096 | Emby HTTP |
+| Clients | Mac | TCP/8097 | Jellyfin HTTP |
+
+For long-lived NFS on a stateful firewall, see the
+[Firewall rule (OPNsense / pf example)](#firewall-rule-opnsense--pf-example)
+section above and the [TCP keepalive](#tcp-keepalive-anti-nfs-hang) section below.
+
+---
+
+### 6. Credentials / secrets
+
+You need exactly one secret on the controller: the Mac admin user's
+password. The repo never stores it; it's read from `MAC_PASSWORD`.
+
+```bash
+export MAC_PASSWORD='your-mac-password'
+```
+
+For long-term use store it in the macOS Keychain (see
+[Credentials](#credentials)) and let `make` pick it up. SSH key
+authentication is recommended (`make ssh-key`, one-time), but the
+sudo escalation still needs `MAC_PASSWORD`.
 
 ---
 

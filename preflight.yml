@@ -1,0 +1,203 @@
+---
+# Preflight checks for the macOS host.
+#
+# Runs BEFORE bootstrap to catch issues that would either silently break the
+# install (FileVault → daemons never start at boot) or that we'd rather warn
+# about up-front (power settings for headless operation, missing tooling).
+#
+# Severity model:
+#   hard fail  - playbook stops; user must fix and re-run
+#   warn       - logged in a "Preflight summary" debug block at the end
+#   info       - printed for context, no judgement
+#
+# Standalone: `make preflight`
+# Auto-runs:  `make bootstrap` includes this play first.
+
+- name: Preflight checks (macOS host readiness)
+  hosts: macmini
+  gather_facts: true
+  vars:
+    preflight_warnings: []
+
+  tasks:
+    # ------------------------------------------------------------------
+    # System info (info only)
+    # ------------------------------------------------------------------
+    - name: "preflight | macOS + arch info"
+      ansible.builtin.debug:
+        msg:
+          - "Host:    {{ inventory_hostname }} ({{ ansible_host }})"
+          - "macOS:   {{ ansible_distribution_version | default('?') }}"
+          - "Arch:    {{ ansible_architecture }}"
+          - "Kernel:  {{ ansible_kernel }}"
+
+    - name: "preflight | FAIL if not arm64"
+      ansible.builtin.fail:
+        msg: >
+          This project targets Apple Silicon (arm64).
+          Detected: {{ ansible_architecture }}.
+          Override ffmpeg_path/brew_bin in group_vars if you really want to
+          run on Intel, then remove this guard.
+      when: ansible_architecture != "arm64"
+
+    # ------------------------------------------------------------------
+    # sudo (hard fail if become can't escalate)
+    # ------------------------------------------------------------------
+    - name: "preflight | Verify sudo works (become)"
+      ansible.builtin.command: /usr/bin/id -u
+      become: true
+      register: sudo_check
+      changed_when: false
+      failed_when: sudo_check.stdout | trim != "0"
+
+    # ------------------------------------------------------------------
+    # FileVault — hard fail if enabled (headless server cannot auto-boot)
+    # ------------------------------------------------------------------
+    - name: "preflight | Check FileVault status"
+      ansible.builtin.command: /usr/bin/fdesetup status
+      become: true
+      register: fv_status
+      changed_when: false
+
+    - name: "preflight | FAIL if FileVault is ON"
+      ansible.builtin.fail:
+        msg: |
+          FileVault is enabled on this Mac. For a headless media server this
+          will break unattended boots — LaunchDaemons cannot start until
+          someone unlocks the disk at the EFI prompt.
+
+          Output: {{ fv_status.stdout }}
+
+          Disable it:
+            System Settings → Privacy & Security → FileVault → Turn Off
+            (decryption can take hours; wait for it to finish before re-running)
+
+          Then re-run: make preflight
+      when: "'FileVault is Off' not in fv_status.stdout"
+
+    # ------------------------------------------------------------------
+    # SIP — info only. We intentionally do NOT require it disabled; this
+    # project writes only to non-SIP-protected paths.
+    # ------------------------------------------------------------------
+    - name: "preflight | Check SIP status"
+      ansible.builtin.command: /usr/bin/csrutil status
+      register: sip_status
+      changed_when: false
+      failed_when: false
+
+    - name: "preflight | SIP info"
+      ansible.builtin.debug:
+        msg:
+          - "{{ sip_status.stdout | default('csrutil unavailable') }}"
+          - "(SIP enabled is the expected/recommended state — this project does
+             not require disabling SIP.)"
+
+    # ------------------------------------------------------------------
+    # Xcode CLT — info only (mac_base installs if missing).
+    # ------------------------------------------------------------------
+    - name: "preflight | Check Xcode Command Line Tools"
+      ansible.builtin.command: /usr/bin/xcode-select -p
+      register: clt_check
+      failed_when: false
+      changed_when: false
+
+    - name: "preflight | CLT info"
+      ansible.builtin.debug:
+        msg: >
+          Xcode CLT:
+          {{ ('present at ' ~ clt_check.stdout) if clt_check.rc == 0
+             else 'MISSING (mac_base will install via softwareupdate, ~5-15min)' }}
+
+    # ------------------------------------------------------------------
+    # Homebrew — info only (mac_base installs if missing).
+    # ------------------------------------------------------------------
+    - name: "preflight | Check Homebrew at {{ brew_bin }}"
+      ansible.builtin.stat:
+        path: "{{ brew_bin }}"
+      register: brew_stat
+
+    - name: "preflight | Homebrew info"
+      ansible.builtin.debug:
+        msg: >
+          Homebrew at {{ brew_bin }}:
+          {{ 'present' if brew_stat.stat.exists else 'MISSING (mac_base will install NONINTERACTIVE as ' ~ brew_install_user ~ ')' }}
+
+    # ------------------------------------------------------------------
+    # ffmpeg — info only (jellyfin_install will brew-install if missing)
+    # ------------------------------------------------------------------
+    - name: "preflight | Check ffmpeg at {{ ffmpeg_path }}"
+      ansible.builtin.stat:
+        path: "{{ ffmpeg_path }}"
+      register: ffmpeg_stat
+
+    - name: "preflight | ffmpeg info"
+      ansible.builtin.debug:
+        msg: >
+          ffmpeg at {{ ffmpeg_path }}:
+          {{ 'present' if ffmpeg_stat.stat.exists else 'MISSING (jellyfin_install will brew-install)' }}
+
+    # ------------------------------------------------------------------
+    # Power settings — warn (recommended for headless server)
+    # ------------------------------------------------------------------
+    - name: "preflight | Read pmset"
+      ansible.builtin.command: /usr/bin/pmset -g custom
+      become: true
+      register: pmset_out
+      changed_when: false
+
+    - name: "preflight | Parse pmset values"
+      ansible.builtin.set_fact:
+        pm_sleep: "{{ pmset_out.stdout | regex_search('(?m)^ +sleep +([0-9]+)', '\\1') | first | default('?') }}"
+        pm_autorestart: "{{ pmset_out.stdout | regex_search('(?m)^ +autorestart +([0-9]+)', '\\1') | first | default('?') }}"
+        pm_womp: "{{ pmset_out.stdout | regex_search('(?m)^ +womp +([0-9]+)', '\\1') | first | default('?') }}"
+
+    - name: "preflight | Record power-setting warnings"
+      ansible.builtin.set_fact:
+        preflight_warnings: "{{ preflight_warnings + [item] }}"
+      loop:
+        - "{{ 'pmset sleep=' ~ pm_sleep ~ ' (recommended: 0). Fix: sudo pmset -a sleep 0' if pm_sleep != '0' else '' }}"
+        - "{{ 'pmset autorestart=' ~ pm_autorestart ~ ' (recommended: 1, reboot after power loss). Fix: sudo pmset -a autorestart 1' if pm_autorestart != '1' else '' }}"
+        - "{{ 'pmset womp=' ~ pm_womp ~ ' (recommended: 1, wake on LAN). Fix: sudo pmset -a womp 1' if pm_womp != '1' else '' }}"
+      when: item | length > 0
+
+    # ------------------------------------------------------------------
+    # /data symlink — info only (created at boot AFTER mac_base runs once)
+    # ------------------------------------------------------------------
+    - name: "preflight | Check {{ data_root }} symlink"
+      ansible.builtin.stat:
+        path: "{{ data_root }}"
+      register: data_stat
+
+    - name: "preflight | /data info"
+      ansible.builtin.debug:
+        msg: >
+          {{ data_root }}:
+          {{ 'symlink → ' ~ data_stat.stat.lnk_source if data_stat.stat.islnk | default(false)
+             else ('exists (not a symlink — was synthetic.conf applied?)' if data_stat.stat.exists
+             else 'MISSING (expected on first run — created at boot after bootstrap-base + reboot)') }}
+
+    # ------------------------------------------------------------------
+    # NFS server reachable — warn (TCP/2049 should be open)
+    # ------------------------------------------------------------------
+    - name: "preflight | Probe NFS server {{ nfs_server }}:2049"
+      ansible.builtin.wait_for:
+        host: "{{ nfs_server }}"
+        port: 2049
+        timeout: 5
+      register: nfs_probe
+      failed_when: false
+      changed_when: false
+
+    - name: "preflight | Record NFS reachability warning"
+      ansible.builtin.set_fact:
+        preflight_warnings: "{{ preflight_warnings + ['NFS server ' ~ nfs_server ~ ':2049 unreachable from this Mac. Check exports + firewall.'] }}"
+      when: nfs_probe.failed | default(false) or nfs_probe.elapsed | default(0) >= 5
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    - name: "preflight | Summary"
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['Preflight PASSED. Ready for bootstrap.'] if preflight_warnings | length == 0
+             else (['Preflight passed with ' ~ (preflight_warnings | length) ~ ' warning(s):'] + preflight_warnings) }}

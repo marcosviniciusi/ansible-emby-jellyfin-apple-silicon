@@ -3,16 +3,22 @@
 # on a fresh macOS host. Idempotent — safe to re-run.
 #
 # Sequence:
-#   1) mac_base    — media user, /etc/synthetic.conf, /etc/auto_nfs, TCP keepalive plist
-#                    REBOOT REQUIRED here if /data symlink was just declared.
+#   0) preflight        — verify host readiness (FileVault off, Homebrew,
+#                          sudo, arch, NFS reachable). Aborts early if any
+#                          hard prereq fails. Run standalone via `make preflight`.
+#   1) mac_base         — media user, /etc/synthetic.conf, /etc/auto_nfs,
+#                          TCP keepalive plist.
+#                          REBOOT REQUIRED here if /data symlink was just declared.
 #   2) jellyfin_install — download Jellyfin arm64 → /opt/jellyfin → plist → start
 #   3) emby_install     — download Emby arm64 → /Applications/EmbyServer.app → plist → start
 #
 # NOT INCLUDED (manual steps on first install):
-#   - Homebrew install (run /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)")
+#   - Homebrew install (preflight will fail with the install command if missing)
 #   - Restore /var/lib/{emby,jellyfin} from a DB tarball (use 'make backup' from
 #     the previous Mac, then extract on the new Mac before binding launchd)
 #   - NFS export side on solid (/etc/exports must include the new Mac IP)
+
+- ansible.builtin.import_playbook: preflight.yml
 
 - name: Bootstrap Mac system base
   hosts: macmini

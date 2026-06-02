@@ -25,5 +25,5 @@
 #  - keep_db_backups: how many SQLite+config tarballs to retain in
 #    {{ db_backup_dir }}. Each ~ 600M for Jellyfin (gz compressed).
 # -----------------------------------------------------------------------------
-keep_backups: 3
-keep_db_backups: 5
+keep_backups: 10
+keep_db_backups: 10

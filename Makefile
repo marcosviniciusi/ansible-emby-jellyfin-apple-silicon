@@ -7,13 +7,15 @@ EXTRA ?=
 ANSIBLE := MAC_PASSWORD=$(MAC_PASSWORD) ansible-playbook
 ANSIBLE_ADHOC := MAC_PASSWORD=$(MAC_PASSWORD) ansible
 
-.PHONY: help check ping bootstrap bootstrap-base bootstrap-jelly bootstrap-emby \
+.PHONY: help check ping preflight bootstrap bootstrap-base bootstrap-jelly bootstrap-emby \
         update-all update-emby update-jellyfin force-emby force-jellyfin \
-        backup list-backups list-db-backups list-remote-backups ssh-key
+        backup list-backups list-db-backups list-remote-backups ssh-key \
+        stop-services start-services
 
 help:
 	@echo "Bootstrap (disaster-recovery / fresh install):"
-	@echo "  bootstrap         - full from-scratch install (mac_base + jellyfin + emby)"
+	@echo "  preflight         - verify host readiness (FileVault, Homebrew, sudo, NFS)"
+	@echo "  bootstrap         - full from-scratch install (preflight + mac_base + jellyfin + emby)"
 	@echo "  bootstrap-base    - system base only (user, synthetic.conf, auto_nfs, keepalive)"
 	@echo "  bootstrap-jelly   - install Jellyfin only (binary, plist, launchd)"
 	@echo "  bootstrap-emby    - install Emby only (binary, plist, launchd)"
@@ -27,6 +29,8 @@ help:
 	@echo "  force-jellyfin    - reinstall Jellyfin regardless of version"
 	@echo "  force-emby        - reinstall Emby regardless of version"
 	@echo "  backup            - DB+config backup only, no app update"
+	@echo "  stop-services     - stop Emby+Jellyfin and unmount NFS shares"
+	@echo "  start-services    - mount NFS shares and start Emby+Jellyfin"
 	@echo "  list-backups      - list app bundle backups on Mac"
 	@echo "  list-db-backups   - list DB+config tarball backups on Mac (local)"
 	@echo "  list-remote-backups - list DB+config tarball backups on NFS (off-machine)"
@@ -36,6 +40,9 @@ help:
 
 ping:
 	$(ANSIBLE_ADHOC) -i inventory.yml -m ping macmini
+
+preflight:
+	$(ANSIBLE) preflight.yml $(EXTRA)
 
 bootstrap:
 	$(ANSIBLE) bootstrap.yml $(EXTRA)
@@ -69,6 +76,12 @@ force-emby:
 
 backup:
 	$(ANSIBLE) backup-only.yml $(EXTRA)
+
+stop-services:
+	$(ANSIBLE) stop-services.yml $(EXTRA)
+
+start-services:
+	$(ANSIBLE) start-services.yml $(EXTRA)
 
 list-backups:
 	$(ANSIBLE_ADHOC) -i inventory.yml macmini -m shell -a 'ls -la /var/backups/mac-media/' --become
