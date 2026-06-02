@@ -5,9 +5,9 @@ all:
         media01:
           ansible_host: 192.168.251.66
           ansible_user: mgabriel
-          # SSH password auth fallback (preferred: install ssh key via `make ssh-key`)
-          # Override with: ansible-playbook -e ansible_password=XXX -e ansible_become_password=XXX
-          ansible_password: "{{ mac_password | default(lookup('env','MAC_PASSWORD')) }}"
+          # SSH key auth (key installed via `make ssh-key`)
+          ansible_ssh_private_key_file: ~/.ssh/id_rsa
+          # Sudo password still needed for become (privilege escalation)
           ansible_become_password: "{{ mac_password | default(lookup('env','MAC_PASSWORD')) }}"
           ansible_become: true
           ansible_become_method: sudo
