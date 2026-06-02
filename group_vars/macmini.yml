@@ -100,7 +100,7 @@ force_update: false        # if true, reinstall even when versions match
 include_prereleases: false # Emby: also consider beta releases
 
 # Backup retention (how many DB backup tarballs to keep)
-keep_db_backups: 5
+keep_db_backups: 10
 
 # -----------------------------------------------------------------------------
 #  Jellyfin installation paths.
