@@ -98,3 +98,22 @@ http_wait_seconds: 90                              # daemon health-check timeout
 # Update flags (per-invocation, usually overridden via -e)
 force_update: false        # if true, reinstall even when versions match
 include_prereleases: false # Emby: also consider beta releases
+
+# Backup retention (how many DB backup tarballs to keep)
+keep_db_backups: 5
+
+# -----------------------------------------------------------------------------
+#  Jellyfin installation paths.
+#  These match the defaults in roles/jellyfin_install/defaults/main.yml but
+#  are needed by backup-only.yml which doesn't include that role.
+# -----------------------------------------------------------------------------
+jellyfin_install_path: /opt/jellyfin
+jellyfin_data_path: /var/lib/jellyfin
+
+# -----------------------------------------------------------------------------
+#  Emby installation paths.
+#  These match the defaults in roles/emby_install/defaults/main.yml but
+#  are needed by backup-only.yml which doesn't include that role.
+# -----------------------------------------------------------------------------
+emby_app_path: /Applications/EmbyServer.app
+emby_data_path: /var/lib/emby
