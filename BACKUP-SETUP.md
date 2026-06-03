@@ -1,90 +1,93 @@
-# Configuração de Backup Automatizado
+# Automated Backup Setup
 
-Este guia explica como configurar backups diários automáticos do Jellyfin e Emby usando SSH key authentication.
+This guide explains how to configure daily automated backups of Jellyfin
+and Emby using SSH key authentication.
 
-## 1. Preparar o ambiente no servidor que executará os backups
+## 1. Prepare the host that will run the backups
 
-### Instalar o repositório em /opt
+### Install the repository under /opt
 
 ```bash
-# Clone o repositório
-sudo git clone <url-do-repositorio> /opt/ansible-emby-jellyfin-apple-silicon
+# Clone the repository
+sudo git clone <repo-url> /opt/ansible-emby-jellyfin-apple-silicon
 
-# Ajustar permissões (substitua SEU_USUARIO pelo seu usuário)
-sudo chown -R SEU_USUARIO:SEU_GRUPO /opt/ansible-emby-jellyfin-apple-silicon
+# Adjust ownership (replace YOUR_USER / YOUR_GROUP with your account)
+sudo chown -R YOUR_USER:YOUR_GROUP /opt/ansible-emby-jellyfin-apple-silicon
 ```
 
-## 2. Configurar autenticação SSH com chave
+## 2. Configure SSH key authentication
 
-### Gerar chave SSH (se ainda não tiver)
+### Generate an SSH key (if you don't have one yet)
 
 ```bash
 ssh-keygen -t rsa -b 4096 -C "backup@mediaserver"
-# Pressione Enter para aceitar o local padrão (~/.ssh/id_rsa)
-# Pressione Enter para não usar passphrase (ou use se preferir)
+# Press Enter to accept the default location (~/.ssh/id_rsa)
+# Press Enter for no passphrase (or set one if you prefer)
 ```
 
-### Copiar a chave para o Mac Mini
+### Copy the key to the Mac Mini
 
 ```bash
 cd /opt/ansible-emby-jellyfin-apple-silicon
-make ssh-key MAC_PASSWORD=sua_senha_do_mac
+make ssh-key MAC_PASSWORD=your_mac_password
 ```
 
-### Testar a conexão SSH
+### Test the SSH connection
 
 ```bash
 ssh mgabriel@192.168.251.66
-# Deve conectar sem pedir senha
+# Should connect without prompting for a password
 ```
 
-## 3. Criar arquivo de senha para sudo (become)
+## 3. Create the sudo (become) password file
 
-A chave SSH elimina a senha do SSH, mas o Ansible ainda precisa da senha do sudo para operações privilegiadas.
+The SSH key removes the SSH password prompt, but Ansible still needs the
+sudo password for privileged operations.
 
 ```bash
-# Criar arquivo .secrets (NÃO será versionado no git)
+# Create the .secrets file (NOT committed to git)
 cd /opt/ansible-emby-jellyfin-apple-silicon
-echo 'export MAC_PASSWORD="sua_senha_do_sudo"' > .secrets
+echo 'export MAC_PASSWORD="your_sudo_password"' > .secrets
 chmod 600 .secrets
 ```
 
-## 4. Instalar o script de backup
+## 4. Install the backup script
 
 ```bash
-# Copiar script para /usr/local/bin
+# Copy the script to /usr/local/bin
 sudo cp /opt/ansible-emby-jellyfin-apple-silicon/run-backup.sh /usr/local/bin/backup-media-servers.sh
 sudo chmod +x /usr/local/bin/backup-media-servers.sh
 ```
 
-## 5. Testar o backup manualmente
+## 5. Test the backup manually
 
 ```bash
-# Executar o backup
+# Run the backup
 /usr/local/bin/backup-media-servers.sh
 
-# Deve executar sem pedir senha SSH (apenas usa a senha do .secrets para sudo)
+# Should run without prompting for the SSH password
+# (the .secrets file supplies the sudo password)
 ```
 
-## 6. Configurar execução automática diária
+## 6. Configure the daily automatic run
 
-### Opção A: Usando cron (Linux/macOS)
+### Option A: Using cron (Linux/macOS)
 
 ```bash
-# Editar crontab
+# Edit your crontab
 crontab -e
 
-# Adicionar linha para backup diário às 2h da manhã:
+# Add a daily backup at 2 AM:
 0 2 * * * /usr/local/bin/backup-media-servers.sh >> /var/log/media-backup.log 2>&1
 
-# Criar o arquivo de log (primeira vez)
+# Create the log file (first time only)
 sudo touch /var/log/media-backup.log
-sudo chown SEU_USUARIO /var/log/media-backup.log
+sudo chown YOUR_USER /var/log/media-backup.log
 ```
 
-### Opção B: Usando systemd timer (Linux)
+### Option B: Using a systemd timer (Linux)
 
-Crie o serviço:
+Create the service unit:
 
 ```bash
 sudo tee /etc/systemd/system/media-backup.service > /dev/null <<'EOF'
@@ -94,14 +97,14 @@ After=network.target
 
 [Service]
 Type=oneshot
-User=SEU_USUARIO
+User=YOUR_USER
 ExecStart=/usr/local/bin/backup-media-servers.sh
 StandardOutput=journal
 StandardError=journal
 EOF
 ```
 
-Crie o timer:
+Create the timer:
 
 ```bash
 sudo tee /etc/systemd/system/media-backup.timer > /dev/null <<'EOF'
@@ -119,81 +122,81 @@ WantedBy=timers.target
 EOF
 ```
 
-Ativar o timer:
+Enable the timer:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable media-backup.timer
 sudo systemctl start media-backup.timer
 
-# Verificar status
+# Check status
 sudo systemctl status media-backup.timer
 sudo systemctl list-timers --all | grep media-backup
 ```
 
-## 7. Verificar logs
+## 7. Check the logs
 
-### Com cron:
+### With cron:
 ```bash
 tail -f /var/log/media-backup.log
 ```
 
-### Com systemd:
+### With systemd:
 ```bash
 journalctl -u media-backup.service -f
 ```
 
-## 8. Verificar backups criados
+## 8. Verify the resulting backups
 
-Os backups são salvos em:
-- **Local no Mac Mini**: `/var/backups/mac-media/db/`
-- **NFS remoto**: Conforme configurado em `nfs_backup_export`
+Backups are written to:
+- **Locally on the Mac Mini**: `/var/backups/mac-media/db/`
+- **Remote NFS**: as configured in `nfs_backup_export`
 
 ```bash
-# Listar backups locais no Mac Mini
+# List local backups on the Mac Mini
 ssh mgabriel@192.168.251.66 'ls -lh /var/backups/mac-media/db/'
 
-# Ou usar o Makefile
+# Or use the Makefile
 cd /opt/ansible-emby-jellyfin-apple-silicon
 make list-db-backups
 ```
 
-## Estrutura de arquivos
+## File layout
 
 ```
 /opt/ansible-emby-jellyfin-apple-silicon/
-├── .secrets                    # Senha do sudo (NÃO versionado)
-├── inventory.yml              # Configurado com SSH key
-├── backup-only.yml            # Playbook de backup
-├── group_vars/macmini.yml     # Variáveis (paths, retention, etc)
-└── run-backup.sh              # Script de backup (copiado para /usr/local/bin)
+├── .secrets                    # sudo password (NOT versioned)
+├── inventory.yml               # Configured with SSH key
+├── backup-only.yml             # Backup playbook
+├── group_vars/macmini.yml      # Variables (paths, retention, etc.)
+└── run-backup.sh               # Backup script (copied to /usr/local/bin)
 
 /usr/local/bin/
-└── backup-media-servers.sh    # Script que executa o backup
+└── backup-media-servers.sh     # Script that runs the backup
 ```
 
-## Segurança
+## Security
 
-- ✅ Chave SSH privada protegida (`~/.ssh/id_rsa` com permissão 600)
-- ✅ Arquivo `.secrets` protegido (permissão 600)
-- ✅ `.secrets` está no `.gitignore` (não será commitado)
-- ⚠️  Considere usar Ansible Vault para criptografar senhas em produção
+- ✅ Private SSH key protected (`~/.ssh/id_rsa`, mode 600)
+- ✅ `.secrets` file protected (mode 600)
+- ✅ `.secrets` is in `.gitignore` (will not be committed)
+- ⚠️ Consider using Ansible Vault to encrypt passwords in production
 
 ## Troubleshooting
 
-### Erro: "Permission denied (publickey,password)"
-- Verifique se a chave SSH foi copiada: `make ssh-key MAC_PASSWORD=senha`
-- Teste a conexão SSH manualmente: `ssh mgabriel@192.168.251.66`
+### Error: "Permission denied (publickey,password)"
+- Confirm the SSH key was copied: `make ssh-key MAC_PASSWORD=password`
+- Test the SSH connection manually: `ssh mgabriel@192.168.251.66`
 
-### Erro: "BECOME password required"
-- Verifique se o arquivo `.secrets` existe e está correto
-- Confirme que `MAC_PASSWORD` está exportado corretamente
+### Error: "BECOME password required"
+- Confirm the `.secrets` file exists and is correct
+- Confirm `MAC_PASSWORD` is exported correctly
 
-### Erro: "Variable 'xxx' is undefined"
-- Verifique se todas as variáveis estão em `group_vars/macmini.yml`
-- Confirme que você está usando o inventory correto: `-i inventory.yml`
+### Error: "Variable 'xxx' is undefined"
+- Confirm every variable is defined in `group_vars/macmini.yml`
+- Confirm you're using the right inventory: `-i inventory.yml`
 
-### Backup não executou no horário agendado
-- **Cron**: Verifique logs com `tail /var/log/media-backup.log`
-- **Systemd**: Verifique com `systemctl status media-backup.timer`
-- Confirme que o caminho do script está correto
+### The backup didn't run at the scheduled time
+- **Cron**: check logs with `tail /var/log/media-backup.log`
+- **Systemd**: check with `systemctl status media-backup.timer`
+- Confirm the script path is correct
