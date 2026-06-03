@@ -1,7 +1,18 @@
 SHELL := /bin/bash
 
-# Override with: make MAC_PASSWORD=xxx update-all
-MAC_PASSWORD ?= $(shell echo $$MAC_PASSWORD)
+# MAC_PASSWORD resolution order (highest wins):
+#   1. `make MAC_PASSWORD=xxx <target>`        (command-line override)
+#   2. exported env var                         (e.g. `export MAC_PASSWORD=...`)
+#   3. .secrets file in the repo root           (sourced as shell — same file
+#                                                run-backup.sh reads; format:
+#                                                `export MAC_PASSWORD="..."`)
+#
+# .secrets is in .gitignore and should be mode 600.
+ifeq ($(strip $(MAC_PASSWORD)),)
+  ifneq (,$(wildcard .secrets))
+    MAC_PASSWORD := $(shell . ./.secrets && echo $$MAC_PASSWORD)
+  endif
+endif
 
 EXTRA ?=
 ANSIBLE := MAC_PASSWORD=$(MAC_PASSWORD) ansible-playbook
@@ -36,7 +47,8 @@ help:
 	@echo "  list-remote-backups - list DB+config tarball backups on NFS (off-machine)"
 	@echo "  ssh-key           - copy local SSH key to Mac (one-time)"
 	@echo ""
-	@echo "Password: export MAC_PASSWORD=xxx  OR  make MAC_PASSWORD=xxx <target>"
+	@echo "Password: 'make MAC_PASSWORD=xxx <target>'  OR  'export MAC_PASSWORD=xxx'"
+	@echo "          OR  create .secrets with: echo 'export MAC_PASSWORD=\"xxx\"' > .secrets && chmod 600 .secrets"
 
 ping:
 	$(ANSIBLE_ADHOC) -i inventory.yml -m ping macmini
