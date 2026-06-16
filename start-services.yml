@@ -5,11 +5,12 @@
 # online (or after maintenance) to bring the stack back up.
 #
 # Sequence:
-#   1) Reload automount (re-read /etc/auto_nfs, in case it was touched)
-#   2) Trigger autofs by stat-ing the mount points
-#   3) Verify both NFS mounts are present
-#   4) Bootstrap Jellyfin + Emby LaunchDaemons
-#   5) Wait for HTTP /System/Info/Public on both
+#   1) Reload automount (re-read /etc/auto_nfs)
+#   2) Bootstrap Jellyfin + Emby LaunchDaemons
+#      (autofs mounts /data/videos and /data/nfs-midia on first access by
+#       the daemons themselves — no separate mount step needed)
+#   3) Wait for HTTP /System/Info/Public on both — this is the real proof
+#      that NFS mounted AND the daemon initialized successfully
 #
 # Assumes /etc/auto_nfs and the LaunchDaemon plists are already in place
 # (i.e. mac_base, jellyfin_install, emby_install have already run).
@@ -24,44 +25,16 @@
       become: true
       changed_when: false
 
-    - name: "start | Trigger autofs by listing each mount point"
-      ansible.builtin.shell: |
-        /bin/ls "{{ item }}" >/dev/null 2>&1 || true
-      args:
-        executable: /bin/bash
-      loop:
-        - "{{ videos_mount }}"
-        - "{{ nfs_midia_mount }}"
-      become: true
-      changed_when: false
-
-    - name: "start | Wait for {{ videos_mount }} to be NFS-mounted"
-      ansible.builtin.shell: |
-        /sbin/mount | grep -q " on {{ videos_mount }} .* nfs"
-      args:
-        executable: /bin/bash
-      become: true
-      register: videos_mounted
-      retries: 12
-      delay: 5
-      until: videos_mounted.rc == 0
-      changed_when: false
-
-    - name: "start | Wait for {{ nfs_midia_mount }} to be NFS-mounted"
-      ansible.builtin.shell: |
-        /sbin/mount | grep -q " on {{ nfs_midia_mount }} .* nfs"
-      args:
-        executable: /bin/bash
-      become: true
-      register: midia_mounted
-      retries: 12
-      delay: 5
-      until: midia_mounted.rc == 0
-      changed_when: false
+    # launchctl bootout is async — bootstrap right after can race ("Input/output
+    # error", rc=5). Poll until the label is gone, then bootstrap.
 
     - name: "start | Bootstrap Jellyfin LaunchDaemon"
       ansible.builtin.shell: |
         /bin/launchctl bootout system/{{ jellyfin_launchd_label }} 2>/dev/null || true
+        for i in $(seq 1 20); do
+          /bin/launchctl print system/{{ jellyfin_launchd_label }} >/dev/null 2>&1 || break
+          sleep 0.5
+        done
         /bin/launchctl bootstrap system {{ launchd_path }}/{{ jellyfin_launchd_label }}.plist
       args:
         executable: /bin/bash
@@ -71,6 +44,10 @@
     - name: "start | Bootstrap Emby LaunchDaemon"
       ansible.builtin.shell: |
         /bin/launchctl bootout system/{{ emby_launchd_label }} 2>/dev/null || true
+        for i in $(seq 1 20); do
+          /bin/launchctl print system/{{ emby_launchd_label }} >/dev/null 2>&1 || break
+          sleep 0.5
+        done
         /bin/launchctl bootstrap system {{ launchd_path }}/{{ emby_launchd_label }}.plist
       args:
         executable: /bin/bash
@@ -100,7 +77,5 @@
     - name: "start | Summary"
       ansible.builtin.debug:
         msg:
-          - "NFS {{ videos_mount }}:    mounted"
-          - "NFS {{ nfs_midia_mount }}: mounted"
-          - "Jellyfin OK: {{ jf_check.json.ServerName }} v{{ jf_check.json.Version }}"
-          - "Emby OK:     {{ emby_check.json.ServerName }} v{{ emby_check.json.Version }}"
+          - "Jellyfin OK: {{ jf_check.json['ServerName'] | default('?') }} v{{ jf_check.json['Version'] | default('?') }}"
+          - "Emby OK:     {{ emby_check.json['ServerName'] | default('?') }} v{{ emby_check.json['Version'] | default('?') }}"
