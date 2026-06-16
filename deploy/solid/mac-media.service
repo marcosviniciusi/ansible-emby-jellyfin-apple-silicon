@@ -1,0 +1,30 @@
+[Unit]
+Description=Mac media services (Emby + Jellyfin) lifecycle from Solid NAS
+Documentation=https://github.com/marcosviniciusi/ansible-emby-jellyfin-apple-silicon
+
+# Boot ordering: only run start-services once the network is online and the
+# NFS exports are up. systemd silently ignores names in After= that do not
+# resolve to a real unit, so listing both nfs-server.service and
+# nfs-kernel-server.service is portable across Debian variants (OMV uses
+# the kernel-mode export server, but distros differ).
+After=network-online.target nfs-server.service nfs-kernel-server.service
+Wants=network-online.target
+
+# Shutdown ordering: DefaultDependencies=yes (default) implicitly orders us
+# Before=shutdown.target, so ExecStop runs BEFORE the network is torn down.
+# That means the SSH+Ansible call to the Mac still has connectivity to push
+# stop-services to launchd over there.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/ansible-emby-jellyfin-apple-silicon
+ExecStart=/opt/ansible-emby-jellyfin-apple-silicon/deploy/solid/wrap.sh start-services
+ExecStop=/opt/ansible-emby-jellyfin-apple-silicon/deploy/solid/wrap.sh stop-services
+TimeoutStartSec=600
+TimeoutStopSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
